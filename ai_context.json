@@ -1,0 +1,85 @@
+{
+  "project_name": "collision-research",
+  "project_type": "robotics_collision_research",
+  "purpose": "Research fast collision detection and collision-aware motion filtering for a 6-axis haptically controlled robot arm game.",
+  "fixed_context": {
+    "robot_model": "UR12e",
+    "geometry_equivalent_model": "UR10e",
+    "degrees_of_freedom": 6,
+    "input_device": "6 haptic dials",
+    "control_style": "real-time joint jogging",
+    "host_loop_target_hz": 100,
+    "haptic_loop_hz": 50,
+    "simulated_robot_physics_hz": 200,
+    "current_control_pipeline": [
+      "raw_dial",
+      "joint_command",
+      "static_joint_clamp",
+      "rate_limit",
+      "planned_target",
+      "robot_command",
+      "haptic_feedback"
+    ],
+    "integration_target": "Replace the current pass-through planned target with a collision-aware planner or filter.",
+    "environment_scope": [
+      "robot_self_collision",
+      "fixed_environment_collision"
+    ],
+    "excluded_collision_scope": [
+      "loose_balls",
+      "soft_game_objects"
+    ]
+  },
+  "current_default_parameters": {
+    "gear_ratio_dial_deg_per_joint_deg": 10.0,
+    "dial_max_velocity_dps": 5.0,
+    "robot_max_velocity_dps": 30.0,
+    "default_joint_limits_deg": {
+      "min": -180.0,
+      "max": 180.0
+    }
+  },
+  "research_bias": {
+    "prefer_analytic_primitives": true,
+    "mesh_collision_default": false,
+    "primary_primitives": [
+      "sphere",
+      "plane",
+      "oriented_box"
+    ],
+    "secondary_primitives": [
+      "capsule"
+    ]
+  },
+  "desired_behavior": [
+    "block motion into hard constraints",
+    "allow motion that increases clearance",
+    "allow tangential sliding along surfaces",
+    "remain controllable in corners and narrow passages",
+    "allow backing out of trapped situations",
+    "remain stable under rapid direction changes",
+    "remain stable under multi-axis competing inputs"
+  ],
+  "key_questions": [
+    "Are simple analytic primitives fast enough for the target control budget?",
+    "What query outputs are needed beyond boolean collision?",
+    "What response method is stable and intuitive under multi-axis jogging?",
+    "Are spheres alone enough, or are planes and oriented boxes required?",
+    "How much parallelization is actually needed after analytic optimization?"
+  ],
+  "expected_query_outputs": [
+    "collision_boolean",
+    "minimum_signed_distance",
+    "penetration_depth",
+    "contact_normal",
+    "nearest_pair_identifiers",
+    "per_joint_sensitivity_hint"
+  ],
+  "first_phase_deliverables": [
+    "primitive_query_benchmark_harness",
+    "scene_representation_for_robot_and_environment",
+    "scenario_library_for_corner_cases",
+    "candidate_collision_response_methods",
+    "integration_recommendation_for_main_game_repo"
+  ]
+}
