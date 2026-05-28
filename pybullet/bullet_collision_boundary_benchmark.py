@@ -70,7 +70,9 @@ def load_scene():
         robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
 
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
-    lower = [joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES]
+    lower = [
+        joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES
+    ]
     upper = [joints[n].limit.upper if joints[n].limit else math.pi for n in JOINT_NAMES]
     return robot_cell, robot_cell_state, lower, upper
 
@@ -498,16 +500,24 @@ def print_visual_comparison(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Joint-0 boundary-search benchmark")
-    parser.add_argument("--duration", type=float, default=20.0, help="Nominal motion horizon in seconds")
-    parser.add_argument("--speed", type=float, default=0.6, help="Auto motion speed (rad/s)")
+    parser.add_argument(
+        "--duration", type=float, default=20.0, help="Nominal motion horizon in seconds"
+    )
+    parser.add_argument(
+        "--speed", type=float, default=0.6, help="Auto motion speed (rad/s)"
+    )
     parser.add_argument(
         "--method",
         choices=["linear", "exp_binary", "all"],
         default="all",
         help="Boundary search method",
     )
-    parser.add_argument("--step", type=float, default=0.03, help="Initial step size (rad)")
-    parser.add_argument("--max-tries", type=int, default=64, help="Max outward tries per side")
+    parser.add_argument(
+        "--step", type=float, default=0.03, help="Initial step size (rad)"
+    )
+    parser.add_argument(
+        "--max-tries", type=int, default=64, help="Max outward tries per side"
+    )
     parser.add_argument(
         "--refine-iters",
         type=int,
