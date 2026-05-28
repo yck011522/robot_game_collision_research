@@ -54,7 +54,7 @@
   "desired_behavior": [
     "block motion into hard constraints",
     "allow motion that increases clearance",
-    "allow tangential sliding along surfaces",
+    "allow tangential sliding along collision surfaces",
     "remain controllable in corners and narrow passages",
     "allow backing out of trapped situations",
     "remain stable under rapid direction changes",
