@@ -121,3 +121,7 @@ that pass-through behavior with a collision-aware filtered target.
 3. Scenario library for walls, corners, corridors, and self-collision cases
 4. One or more candidate collision-aware step filters
 
+## IMPORTANT
+
+1. Ask clarification questions before making assumptions.
+2. Report back the engineering decisions and benchmark results that led you to your conclusions.
