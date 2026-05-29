@@ -67,8 +67,11 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import tkinter as tk
+import traceback
+from dataclasses import dataclass
 from tkinter import ttk
 from concurrent.futures import ProcessPoolExecutor
 
@@ -150,8 +153,40 @@ def _partition(items, n_chunks):
         i += size
     return tuple(out)
 
+
 # UI defaults
-DEFAULT_FPS = 30
+DEFAULT_FPS = 60  # control-loop target Hz
+DEFAULT_GUI_REFRESH_HZ = 15  # Tk repaint Hz. Higher values starve the control
+# thread of the GIL on Windows (tkinter tcl calls don't release the GIL well).
+# Measured on dev laptop (Tk + 5 worker procs):
+#   gui_hz=30 -> ctrl  6 Hz, input latency p50 = 146 ms (sluggish)
+#   gui_hz=15 -> ctrl 26 Hz, input latency p50 =   1 ms (snappy)
+#   gui_hz=10 -> ctrl 27 Hz, input latency p50 =   2 ms
+# Override with --gui-hz.
+GUI_COLLISION_CHECK_HZ = 10  # how often to refresh the FREE/COLLISION label
+
+
+@dataclass(frozen=True)
+class IntentSnapshot:
+    """Immutable snapshot of all UI inputs handed to the control thread.
+
+    Rebuilt on the Tk thread on every key event or slider change, then
+    re-bound onto the explorer via a single attribute assignment, which is
+    atomic under the CPython GIL. The control thread reads it lock-free.
+    """
+
+    pressed: frozenset = frozenset()
+    slow_dps: float = 10.0
+    fast_dps: float = 30.0
+    max_vel_dps: tuple = (20.0, 20.0, 20.0, 30.0, 30.0, 30.0)
+    max_accel_dps2: tuple = (50.0, 50.0, 50.0, 80.0, 80.0, 80.0)
+    prox_floor_pct: float = 50.0
+    path_cutoff_deg: float = 3.0
+    path_shape: str = "linear"
+    exp_k: float = 3.0
+    target_fps: float = DEFAULT_FPS
+
+
 # Per-axis defaults. First three joints (big arm) get conservative limits;
 # wrist joints (last three) can move faster.
 DEFAULT_MAX_VEL_DPS = [20.0, 20.0, 20.0, 30.0, 30.0, 30.0]
@@ -375,6 +410,7 @@ class KeyboardExplorer:
         patch_stats: dict,
         n_forward_workers: int = DEFAULT_FORWARD_WORKERS,
         n_prox_workers: int = DEFAULT_PROX_WORKERS,
+        gui_refresh_hz: float = DEFAULT_GUI_REFRESH_HZ,
     ):
         self.root = root
         self.fwd_executor = fwd_executor
@@ -384,6 +420,7 @@ class KeyboardExplorer:
         self.cfg = robot_cell_state.robot_configuration.copy()
         self.joint_limits = joint_limits_rad
         self.patch_stats = patch_stats
+        self.gui_refresh_hz = max(1.0, gui_refresh_hz)
         # Deterministic partitions derived from worker counts
         self.n_forward_workers = n_forward_workers
         self.n_prox_workers = n_prox_workers
@@ -452,15 +489,42 @@ class KeyboardExplorer:
         self.session_t0 = time.perf_counter()
         self.tick_n = 0
 
+        # ---- Threading / MVC state ------------------------------------
+        # Control thread owns heavy compute (worker dispatch, integrate,
+        # log write). Tk thread owns widgets + gui_planner. The single
+        # coupling point is self._intent (atomic attribute rebind).
+        self._stop = threading.Event()
+        self._intent = IntentSnapshot()
+        self._last_gui_t = 0.0
+        self._gui_fps_ema = 0.0
+        self._last_coll_check_t = 0.0
+        # Bounded metric buffers for --metrics dump.
+        self._control_samples: list = (
+            []
+        )  # (t_now, dt, late_ms, fwd_ms, prox_pipe_ms, prox_age_ms)
+        self._gui_samples: list = []  # (t_now, dt)
+        self._pressed_log: list = []  # (t_now, frozenset)
+        self._input_events: list = []  # (t_dispatch, "press"/"release", key)
+        self._resize_events: list = []  # (t_dispatch, w, h)
+        self._ctrl_thread: threading.Thread | None = None
+
         self._build_ui()
         self._bind_keys()
         self._open_session_log()
 
-        # Apply initial pose to GUI
+        # Wire intent rebuilds on every tunable change, seed the snapshot.
+        self._wire_intent_traces()
+        self._rebuild_intent()
+
+        # Apply initial pose to GUI (Tk thread, before view loop starts).
         self._push_pose_to_gui()
 
-        # Start ticking
-        self.root.after(0, self._tick)
+        # Start background control loop, then schedule UI refreshes.
+        self._ctrl_thread = threading.Thread(
+            target=self._control_loop, name="explorer-control", daemon=True
+        )
+        self._ctrl_thread.start()
+        self.root.after(0, self._refresh_view)
 
     # ------------------------------------------------------------------ UI
 
@@ -826,6 +890,44 @@ class KeyboardExplorer:
             if self.session_log_path:
                 print("Session log closed:", self.session_log_path)
 
+    # ---------------------------------------------- intent (Tk -> ctrl)
+
+    def _wire_intent_traces(self) -> None:
+        def on_var(*_):
+            self._rebuild_intent()
+
+        for v in self.max_vel_vars + self.max_accel_vars:
+            v.trace_add("write", on_var)
+        for v in (
+            self.slow_var,
+            self.fast_var,
+            self.prox_floor_var,
+            self.path_cutoff_var,
+            self.target_fps_var,
+            self.exp_k_var,
+        ):
+            v.trace_add("write", on_var)
+        self.path_shape_var.trace_add("write", on_var)
+
+    def _rebuild_intent(self) -> None:
+        """Atomically rebind self._intent from the current Tk vars + keys."""
+        try:
+            self._intent = IntentSnapshot(
+                pressed=frozenset(self.pressed),
+                slow_dps=float(self.slow_var.get()),
+                fast_dps=float(self.fast_var.get()),
+                max_vel_dps=tuple(float(v.get()) for v in self.max_vel_vars),
+                max_accel_dps2=tuple(float(v.get()) for v in self.max_accel_vars),
+                prox_floor_pct=float(self.prox_floor_var.get()),
+                path_cutoff_deg=float(self.path_cutoff_var.get()),
+                path_shape=self.path_shape_var.get(),
+                exp_k=float(self.exp_k_var.get()),
+                target_fps=float(self.target_fps_var.get()),
+            )
+        except Exception:
+            # Tk var may be mid-edit (Spinbox while typing); keep old intent.
+            pass
+
     # ------------------------------------------------------------- keyboard
 
     def _bind_keys(self) -> None:
@@ -843,14 +945,12 @@ class KeyboardExplorer:
         if self._focus_is_text_entry():
             return
         self.pressed.add(key)
+        self._rebuild_intent()
 
     def _on_release(self, key: str) -> None:
-        if self._focus_is_text_entry():
-            # Still discard so we don't get a stuck key from a release that
-            # happened after focus moved away.
-            self.pressed.discard(key)
-            return
+        # Always discard so we don't get a stuck key if focus moved away.
         self.pressed.discard(key)
+        self._rebuild_intent()
 
     def _focus_is_text_entry(self) -> bool:
         """True if the focused widget should consume jog keys (Spinbox/Entry/Text)."""
@@ -863,19 +963,20 @@ class KeyboardExplorer:
         cls = w.winfo_class()
         return cls in ("TEntry", "Entry", "Spinbox", "TSpinbox", "Text")
 
-    def _desired_velocity_dps(self) -> list[float]:
-        """Algebraic sum of held keys per axis, in deg/s."""
-        slow = self.slow_var.get()
-        fast = self.fast_var.get()
+    def _desired_velocity_dps(self, intent: IntentSnapshot) -> list[float]:
+        """Algebraic sum of held keys per axis (from intent), in deg/s."""
+        slow = intent.slow_dps
+        fast = intent.fast_dps
+        pressed = intent.pressed
         out = [0.0] * 6
         for i in range(6):
-            if FAST_POS_KEYS[i] in self.pressed:
+            if FAST_POS_KEYS[i] in pressed:
                 out[i] += fast
-            if SLOW_POS_KEYS[i] in self.pressed:
+            if SLOW_POS_KEYS[i] in pressed:
                 out[i] += slow
-            if SLOW_NEG_KEYS[i] in self.pressed:
+            if SLOW_NEG_KEYS[i] in pressed:
                 out[i] -= slow
-            if FAST_NEG_KEYS[i] in self.pressed:
+            if FAST_NEG_KEYS[i] in pressed:
                 out[i] -= fast
         return out
 
@@ -892,11 +993,28 @@ class KeyboardExplorer:
     # ------------------------------------------------------------- motion
 
     def _push_pose_to_gui(self) -> None:
+        """Push the current pose to the GUI PyBullet client (visual only).
+
+        Deliberately does NOT run a collision check here -- that costs
+        ~20 ms on the GUI client (full narrow-phase + render) and would
+        cap the live tick rate. Collision status is refreshed at
+        GUI_COLLISION_CHECK_HZ via `_refresh_in_coll_status`.
+        """
         clamped = [
             max(lo, min(hi, v)) for v, (lo, hi) in zip(self.pos_rad, self.joint_limits)
         ]
         self.cfg.joint_values = clamped
         self.robot_cell_state.robot_configuration = self.cfg
+        try:
+            self.gui_planner.set_robot_cell_state(self.robot_cell_state)
+        except Exception as exc:
+            print("GUI pose update error:", exc, file=sys.stderr)
+
+    def _refresh_in_coll_status(self) -> None:
+        """Run a single collision check on the GUI planner to update the
+        FREE/COLLISION label. Called at most GUI_COLLISION_CHECK_HZ times
+        per second, NOT every tick.
+        """
         try:
             self.gui_planner.check_collision(
                 self.robot_cell_state, options={"verbose": False}
@@ -911,62 +1029,49 @@ class KeyboardExplorer:
         dv_max = max_accel * dt
         return v_cur + max(-dv_max, min(dv_max, v_des - v_cur))
 
-    def _compute_path_scalar(self) -> float:
+    def _compute_path_scalar(self, intent: IntentSnapshot) -> float:
         """Find earliest collision step and convert distance-to-collision to scale.
 
         Spacing is FIXED in joint-space (self.fwd_step_deg_used per step), so
         the scalar is proportional to actual distance regardless of current
         speed. dist_deg = step_index * step_deg.
 
-        Hard cutoff: if the nearest collision is closer than `path_cutoff_var`
-        degrees, the scalar is forced to 0 to stop the motion before crashing.
+        Hard cutoff: if the nearest collision is closer than
+        `intent.path_cutoff_deg`, the scalar is forced to 0 to stop motion.
         """
         self.path_nearest_deg = None
         for k, hit in enumerate(self.fwd_result):  # k = 0..N-1, step (k+1)
             if hit:
                 dist_deg = (k + 1) * self.fwd_step_deg_used
                 self.path_nearest_deg = dist_deg
-                # Hard cutoff to zero if too close
-                cutoff = max(0.0, self.path_cutoff_var.get())
+                cutoff = max(0.0, intent.path_cutoff_deg)
                 if dist_deg <= cutoff:
                     return 0.0
                 max_dist = N_FORWARD_STEPS * self.fwd_step_deg_used
-                # Re-map [cutoff, max_dist] -> [0, 1] so the curve is
-                # continuous: at distance == cutoff the scale is 0, at
-                # distance == max_dist the scale is 1.
                 norm = (dist_deg - cutoff) / max(1e-6, (max_dist - cutoff))
                 norm = max(0.0, min(1.0, norm))
-                shape = self.path_shape_var.get()
+                shape = intent.path_shape
                 if shape == "linear":
                     scale = norm
                 else:
-                    k_steep = max(0.1, self.exp_k_var.get())
+                    k_steep = max(0.1, intent.exp_k)
                     scale = 1.0 - math.exp(-k_steep * norm)
                     scale = max(0.0, min(1.0, scale))
                 return scale
         return 1.0
 
-    def _compute_prox_scalar(self, v_cmd: list[float]) -> float:
-        """Global scalar from the nearest obstacle across ALL axes, BOTH directions.
-
-        Independent of motion direction and user input -- this is a pure
-        'how close are we to anything?' scaler that's always active. If no
-        obstacle exists in the +/-PROBE_HALF_DEG window of any axis, scalar = 1.
-        Otherwise the scalar drops linearly from 1 (at PROBE_HALF_DEG away) to
-        `floor` (at 1 deg away).
-        """
-        floor = max(0.0, min(1.0, self.prox_floor_var.get() / 100.0))
+    def _compute_prox_scalar(self, v_cmd: list[float], intent: IntentSnapshot) -> float:
+        """Global scalar from the nearest obstacle across ALL axes, BOTH directions."""
+        floor = max(0.0, min(1.0, intent.prox_floor_pct / 100.0))
         nearest_deg: float | None = None
         for axis in range(6):
             results = self.prox_results[axis]
-            # Scan negative direction (offsets -1, -2, ..., -PROBE_HALF)
             for j in range(PROBE_HALF_DEG):
                 if results[PROBE_HALF_DEG - 1 - j]:
                     d = j + 1
                     if nearest_deg is None or d < nearest_deg:
                         nearest_deg = d
                     break
-            # Scan positive direction (offsets +1, +2, ..., +PROBE_HALF)
             for j in range(PROBE_HALF_DEG):
                 if results[PROBE_HALF_DEG + j]:
                     d = j + 1
@@ -993,9 +1098,7 @@ class KeyboardExplorer:
         step indices; the worker pool is not free to load-balance.
         """
         futures = [
-            self.fwd_executor.submit(
-                _proc_forward_chunk, (base_rad, step_vec, chunk)
-            )
+            self.fwd_executor.submit(_proc_forward_chunk, (base_rad, step_vec, chunk))
             for chunk in self.forward_chunks
         ]
         results = [f.result() for f in futures]  # blocks until each completes
@@ -1016,9 +1119,7 @@ class KeyboardExplorer:
             return
         offs = tuple(PROBE_OFFSETS_RAD)
         futures = [
-            self.prox_executor.submit(
-                _proc_proximity_chunk, (base_rad, axes, offs)
-            )
+            self.prox_executor.submit(_proc_proximity_chunk, (base_rad, axes, offs))
             for axes in self.prox_axis_chunks
         ]
         self.prox_future = futures
@@ -1051,15 +1152,39 @@ class KeyboardExplorer:
             self.prox_future = None
         return True
 
-    def _tick(self) -> None:
-        t_now = time.perf_counter()
-        dt = t_now - self.last_tick_t
-        self.last_tick_t = t_now
-        if dt <= 0:
-            dt = 1e-3
-        self.last_tick_dt = dt
+    def _control_loop(self) -> None:
+        """Background-thread control loop. No Tk calls, no PyBullet GUI calls."""
+        self.last_tick_t = time.perf_counter()
+        while not self._stop.is_set():
+            intent = self._intent  # atomic snapshot
+            target = max(1.0, intent.target_fps)
+            target_dt = 1.0 / target
+            t_now = time.perf_counter()
+            dt = t_now - self.last_tick_t
+            if dt <= 0:
+                dt = 1e-3
+            self.last_tick_t = t_now
+            late_ms = max(0.0, (dt - target_dt) * 1000.0)
+            try:
+                self._control_step(dt, t_now, intent, late_ms)
+            except Exception as exc:
+                print("Control loop error:", exc, file=sys.stderr)
+                traceback.print_exc()
+            spent = time.perf_counter() - t_now
+            sleep_left = target_dt - spent
+            if sleep_left > 0:
+                # Event.wait wakes early on stop -> shutdown stays prompt.
+                self._stop.wait(sleep_left)
 
-        # FPS measurement (EMA on instantaneous 1/dt)
+    def _control_step(
+        self,
+        dt: float,
+        t_now: float,
+        intent: IntentSnapshot,
+        ctrl_late_ms: float,
+    ) -> None:
+        """One control tick: pure compute, updates only self.* fields + log."""
+        self.last_tick_dt = dt
         inst_fps = 1.0 / dt
         if self.fps_ema == 0.0:
             self.fps_ema = inst_fps
@@ -1068,59 +1193,55 @@ class KeyboardExplorer:
                 1 - self.fps_alpha
             ) * self.fps_ema + self.fps_alpha * inst_fps
 
-        # 0. Harvest any completed proximity batch BEFORE computing clamps,
-        #    so we use the freshest available data.
+        # 0. Harvest completed proximity batch BEFORE we use it.
         self._harvest_proximity_nonblocking()
-        # Age of the proximity data we're about to use (s since harvest)
         self.prox_age_s = t_now - self.prox_last_harvest_t
 
-        # 1. Desired velocity from keys
-        v_des_dps = self._desired_velocity_dps()
+        # 1. Desired velocity from intent
+        v_des_dps = self._desired_velocity_dps(intent)
         self.v_des_rad = [math.radians(v) for v in v_des_dps]
 
-        # 2. Accel-clamp current velocity toward desired (per-axis max accel)
+        # 2. Accel-clamp
         new_v = []
         for i in range(6):
-            max_accel_i = math.radians(self.max_accel_vars[i].get())
+            max_accel_i = math.radians(intent.max_accel_dps2[i])
             new_v.append(
                 self._accel_clamp(self.vel_rad[i], self.v_des_rad[i], max_accel_i, dt)
             )
-        # 3. Max-velocity clamp (per-axis; symmetric)
+        # 3. Per-axis max-vel clamp
         for i in range(6):
-            max_vel_i = math.radians(self.max_vel_vars[i].get())
+            max_vel_i = math.radians(intent.max_vel_dps[i])
             new_v[i] = max(-max_vel_i, min(max_vel_i, new_v[i]))
         self.v_cmd_rad = list(new_v)
 
-        # 4. SYNCHRONOUS forward path check for the EXACT v_cmd direction.
-        #    This is the safety gate. We wait for ALL forward chunks.
+        # 4. SYNCHRONOUS forward path check (safety gate)
         base = tuple(self.pos_rad)
         v_norm = math.sqrt(sum(v * v for v in self.v_cmd_rad))
-        if v_norm > math.radians(0.5):  # > 0.5 deg/s combined
+        fwd_t0 = time.perf_counter()
+        if v_norm > math.radians(0.5):
             step_rad = math.radians(FORWARD_STEP_DEG)
             step_vec = tuple((v / v_norm) * step_rad for v in self.v_cmd_rad)
             self.fwd_step_deg_used = FORWARD_STEP_DEG
             self.fwd_result = self._run_forward_check(base, step_vec)
         else:
             self.fwd_result = [False] * N_FORWARD_STEPS
+        fwd_ms = (time.perf_counter() - fwd_t0) * 1000.0
 
-        # 5. ASYNCHRONOUS proximity dispatch (soft slow-down, not safety).
-        #    Fire-and-forget: harvested at the start of a future tick. We
-        #    skip if a previous batch is still pending (no queueing).
+        # 5. ASYNCHRONOUS proximity dispatch (soft slow-down)
         self._dispatch_proximity_async(base)
 
-        # 6. Compute clamps from the FRESH forward + possibly-stale prox.
-        path_scalar = self._compute_path_scalar()
-        prox_scalar = self._compute_prox_scalar(self.v_cmd_rad)
+        # 6. Clamps
+        path_scalar = self._compute_path_scalar(intent)
+        prox_scalar = self._compute_prox_scalar(self.v_cmd_rad, intent)
         self.last_path_scalar = path_scalar
         self.last_prox_scalar = prox_scalar
         self.v_after_path_rad = [v * path_scalar for v in self.v_cmd_rad]
         final_scalar = min(path_scalar, prox_scalar)
         self.v_out_rad = [v * final_scalar for v in self.v_cmd_rad]
 
-        # 7. Integrate -> new actual velocity for next tick is v_out
+        # 7. Integrate
         self.vel_rad = list(self.v_out_rad)
         self.pos_rad = [self.pos_rad[i] + self.vel_rad[i] * dt for i in range(6)]
-        # Clamp to URDF joint limits (and zero the velocity if hitting a wall)
         for i, (lo, hi) in enumerate(self.joint_limits):
             if self.pos_rad[i] < lo:
                 self.pos_rad[i] = lo
@@ -1131,20 +1252,69 @@ class KeyboardExplorer:
                 if self.vel_rad[i] > 0:
                     self.vel_rad[i] = 0.0
 
-        # 8. Push to GUI
-        self._push_pose_to_gui()
+        # 8. Metrics + log
+        self._control_samples.append(
+            (
+                t_now,
+                dt,
+                ctrl_late_ms,
+                fwd_ms,
+                self.prox_pipeline_ms,
+                self.prox_age_s * 1000.0,
+            )
+        )
+        self._pressed_log.append((t_now, intent.pressed))
+        if len(self._control_samples) > 20000:
+            del self._control_samples[:10000]
+            del self._pressed_log[:10000]
+        self._write_log_tick(final_scalar)
+        self.tick_n += 1
 
-        # ---- update UI text ----
+    # ----------------------------------------------------------- view tick
+
+    def _refresh_view(self) -> None:
+        """Tk-thread tick: repaint widgets from the latest control state."""
+        if self._stop.is_set():
+            return
+        t_now = time.perf_counter()
+        if self._last_gui_t > 0.0:
+            dt = t_now - self._last_gui_t
+            self._gui_samples.append((t_now, dt))
+            if len(self._gui_samples) > 20000:
+                del self._gui_samples[:10000]
+            inst = 1.0 / dt if dt > 0 else 0.0
+            if self._gui_fps_ema == 0.0:
+                self._gui_fps_ema = inst
+            else:
+                self._gui_fps_ema = 0.9 * self._gui_fps_ema + 0.1 * inst
+        self._last_gui_t = t_now
+
+        # Push pose every refresh (cheap)
+        self._push_pose_to_gui()
+        # Throttled FREE/COLLISION refresh
+        if (t_now - self._last_coll_check_t) >= (1.0 / GUI_COLLISION_CHECK_HZ):
+            self._refresh_in_coll_status()
+            self._last_coll_check_t = t_now
+
+        # Text labels
+        path_scalar = self.last_path_scalar
+        prox_scalar = self.last_prox_scalar
+        final_scalar = min(path_scalar, prox_scalar)
         self.clamp_label.config(
             text="path={:.2f}  prox={:.2f}  final={:.2f}".format(
                 path_scalar, prox_scalar, final_scalar
             )
         )
-        target = self.target_fps_var.get()
-        fps_text = "FPS {:5.1f}/{:.0f}".format(self.fps_ema, target)
-        fps_color = "black" if self.fps_ema >= target * 0.9 else "#a02020"
+        target = self._intent.target_fps
+        ctrl_fps = self.fps_ema
+        fps_text = "ctrl {:5.1f}/{:.0f}  gui {:4.1f}".format(
+            ctrl_fps, target, self._gui_fps_ema
+        )
+        fps_color = "black" if ctrl_fps >= target * 0.9 else "#a02020"
         self.fps_label.config(text=fps_text, fg=fps_color)
-        if self.current_in_coll:
+        if self.current_in_coll is None:
+            self.status_label.config(text="(checking...)", bg=COLOR_MARKER_UNKNOWN)
+        elif self.current_in_coll:
             self.status_label.config(text="COLLISION", bg=COLOR_MARKER_COLL)
         else:
             self.status_label.config(text="FREE", bg=COLOR_MARKER_FREE)
@@ -1156,15 +1326,11 @@ class KeyboardExplorer:
             self._draw_vel(i)
         self._draw_fwd()
         self._write_diag()
-        self._write_log_tick(final_scalar)
-        self.tick_n += 1
 
-        # 9. Schedule next tick to hit target FPS
-        target_dt_ms = int(max(1, 1000.0 / max(1.0, target)))
-        # subtract the work we already did to keep wall pacing on target
-        spent_ms = (time.perf_counter() - t_now) * 1000.0
-        sleep_ms = int(max(1, target_dt_ms - spent_ms))
-        self.root.after(sleep_ms, self._tick)
+        period_ms = int(round(1000.0 / self.gui_refresh_hz))
+        spent_ms = int((time.perf_counter() - t_now) * 1000.0)
+        sleep_ms = max(1, period_ms - spent_ms)
+        self.root.after(sleep_ms, self._refresh_view)
 
     # ----------------------------------------------------------- drawing
 
@@ -1390,6 +1556,156 @@ class KeyboardExplorer:
 # ---------------------------------------------------------------------------
 
 
+class ScriptDriver:
+    """Replays a list of UI events into the Tk event loop for automation.
+
+    Each event is a dict with a scheduled offset `t` (seconds from start)
+    and an `action`. Example:
+
+        {"t": 1.0, "action": "press",   "key": "1"}
+        {"t": 2.0, "action": "release", "key": "1"}
+        {"t": 3.5, "action": "resize",  "w": 1200, "h": 600}
+        {"t": 4.0, "action": "set_fps", "value": 90}
+        {"t": 7.0, "action": "quit"}
+    """
+
+    def __init__(self, app, root, events, on_quit):
+        self.app = app
+        self.root = root
+        self.events = events
+        self.on_quit = on_quit
+
+    def start(self) -> None:
+        for ev in self.events:
+            delay_ms = int(round(float(ev.get("t", 0.0)) * 1000.0))
+            self.root.after(delay_ms, lambda e=ev: self._fire(e))
+
+    def _fire(self, ev) -> None:
+        action = ev.get("action")
+        try:
+            if action == "press":
+                key = ev["key"]
+                self.app._input_events.append((time.perf_counter(), "press", key))
+                self.root.event_generate("<KeyPress-{}>".format(key))
+            elif action == "release":
+                key = ev["key"]
+                self.app._input_events.append((time.perf_counter(), "release", key))
+                self.root.event_generate("<KeyRelease-{}>".format(key))
+            elif action == "resize":
+                w = int(ev["w"])
+                h = int(ev["h"])
+                self.app._resize_events.append((time.perf_counter(), w, h))
+                self.root.geometry("{}x{}".format(w, h))
+            elif action == "set_fps":
+                self.app.target_fps_var.set(float(ev["value"]))
+            elif action == "screenshot":
+                path = ev["path"]
+                try:
+                    from PIL import ImageGrab  # type: ignore
+
+                    self.root.update_idletasks()
+                    x = self.root.winfo_rootx()
+                    y = self.root.winfo_rooty()
+                    w = self.root.winfo_width()
+                    h = self.root.winfo_height()
+                    ImageGrab.grab(bbox=(x, y, x + w, y + h)).save(path, "PNG")
+                    print("  screenshot ->", path)
+                except Exception as exc:
+                    print("screenshot failed:", exc, file=sys.stderr)
+            elif action == "quit":
+                self.on_quit()
+            else:
+                print("ScriptDriver: unknown action:", action, file=sys.stderr)
+        except Exception as exc:
+            print("ScriptDriver fire error:", exc, file=sys.stderr)
+
+
+def _pct(lst, p):
+    if not lst:
+        return None
+    s = sorted(lst)
+    i = max(0, min(len(s) - 1, int(round(p / 100.0 * (len(s) - 1)))))
+    return s[i]
+
+
+def _stats(lst):
+    if not lst:
+        return None
+    return {
+        "n": len(lst),
+        "p50": _pct(lst, 50),
+        "p95": _pct(lst, 95),
+        "p99": _pct(lst, 99),
+        "max": max(lst),
+        "mean": sum(lst) / len(lst),
+    }
+
+
+def dump_metrics(path: str, app) -> None:
+    ctrl = list(app._control_samples)
+    gui = list(app._gui_samples)
+    pressed_log = list(app._pressed_log)
+    inputs = list(app._input_events)
+    resizes = list(app._resize_events)
+
+    ctrl_dt_ms = [s[1] * 1000.0 for s in ctrl]
+    ctrl_late_ms = [s[2] for s in ctrl]
+    ctrl_fwd_ms = [s[3] for s in ctrl]
+    ctrl_prox_pipe_ms = [s[4] for s in ctrl]
+    ctrl_prox_age_ms = [s[5] for s in ctrl]
+    gui_dt_ms = [s[1] * 1000.0 for s in gui]
+
+    # Input latency: dispatch -> first control tick where key state matches.
+    latencies_ms = []
+    for t_ev, kind, key in inputs:
+        for t_p, pressed in pressed_log:
+            if t_p < t_ev:
+                continue
+            held = key in pressed
+            if (kind == "press" and held) or (kind == "release" and not held):
+                latencies_ms.append((t_p - t_ev) * 1000.0)
+                break
+
+    # Resize stall: worst gap between gui frames in the 1.5s after a resize.
+    resize_stalls_ms = []
+    for t_r, _w, _h in resizes:
+        worst = 0.0
+        for t_g, dt_g in gui:
+            if t_g < t_r:
+                continue
+            if t_g > t_r + 1.5:
+                break
+            ms = dt_g * 1000.0
+            if ms > worst:
+                worst = ms
+        resize_stalls_ms.append(worst)
+
+    duration = 0.0
+    if ctrl:
+        duration = ctrl[-1][0] - ctrl[0][0]
+
+    out = {
+        "duration_s": duration,
+        "ctrl_ticks": len(ctrl),
+        "ctrl_fps": (len(ctrl) / duration) if duration > 0 else None,
+        "gui_frames": len(gui),
+        "gui_fps": (len(gui) / duration) if duration > 0 else None,
+        "ctrl_dt_ms": _stats(ctrl_dt_ms),
+        "ctrl_late_ms": _stats(ctrl_late_ms),
+        "ctrl_fwd_ms": _stats(ctrl_fwd_ms),
+        "ctrl_prox_pipeline_ms": _stats(ctrl_prox_pipe_ms),
+        "ctrl_prox_age_ms": _stats(ctrl_prox_age_ms),
+        "gui_dt_ms": _stats(gui_dt_ms),
+        "input_latency_ms": _stats(latencies_ms),
+        "resize_stall_ms": _stats(resize_stalls_ms),
+        "inputs_dispatched": len(inputs),
+        "inputs_resolved": len(latencies_ms),
+        "resizes": len(resizes),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+
+
 def _wait_for_workers(executor: ProcessPoolExecutor, n: int) -> None:
     _ = list(executor.map(_proc_ping, range(n * 3)))
 
@@ -1411,6 +1727,32 @@ def _parse_args(argv: list[str] | None = None):
         default=DEFAULT_PROX_WORKERS,
         help="processes dedicated to the asynchronous proximity probe scan "
         "(default {})".format(DEFAULT_PROX_WORKERS),
+    )
+    p.add_argument(
+        "--script",
+        type=str,
+        default=None,
+        help="path to a JSON list of scheduled UI events (automated test).",
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="auto-quit after this many seconds (useful with --script).",
+    )
+    p.add_argument(
+        "--metrics",
+        type=str,
+        default=None,
+        help="on exit, dump control/gui/input metrics as JSON to this path.",
+    )
+    p.add_argument(
+        "--gui-hz",
+        type=float,
+        default=DEFAULT_GUI_REFRESH_HZ,
+        help="Tk repaint / pose-push Hz (default {}). Lowering frees GIL for the control thread.".format(
+            DEFAULT_GUI_REFRESH_HZ
+        ),
     )
     return p.parse_args(argv)
 
@@ -1485,10 +1827,23 @@ def main() -> None:
         patch_stats,
         n_forward_workers=n_fwd,
         n_prox_workers=n_prox,
+        gui_refresh_hz=args.gui_hz,
     )
 
     def on_close():
+        if getattr(on_close, "_done", False):
+            return
+        on_close._done = True
         print("Shutting down ...")
+        app._stop.set()
+        if app._ctrl_thread is not None:
+            app._ctrl_thread.join(timeout=2.0)
+        if args.metrics:
+            try:
+                dump_metrics(args.metrics, app)
+                print("Metrics written to:", args.metrics)
+            except Exception as exc:
+                print("Metrics dump failed:", exc, file=sys.stderr)
         try:
             app.close_log()
         except Exception:
@@ -1502,25 +1857,24 @@ def main() -> None:
             gui_client.__exit__(None, None, None)
         except Exception:
             pass
-        root.destroy()
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    if args.script:
+        with open(args.script, "r", encoding="utf-8") as f:
+            script_events = json.load(f)
+        ScriptDriver(app, root, script_events, on_close).start()
+    if args.duration is not None:
+        root.after(int(args.duration * 1000), on_close)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     try:
         root.mainloop()
     finally:
-        try:
-            app.close_log()
-        except Exception:
-            pass
-        for ex in (fwd_executor, prox_executor):
-            try:
-                ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        try:
-            gui_client.__exit__(None, None, None)
-        except Exception:
-            pass
+        # on_close is idempotent; this catches mainloop-side exits.
+        on_close()
 
 
 if __name__ == "__main__":

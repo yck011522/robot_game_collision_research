@@ -1,2 +1,9 @@
 *.rhl
 *.pyc
+
+# Keyboard-explorer runtime artifacts
+pybullet/_metrics*.json
+pybullet/_shots/
+pybullet/explorer_logs/
+pybullet/_tk_smoke_*
+pybullet/__pycache__/

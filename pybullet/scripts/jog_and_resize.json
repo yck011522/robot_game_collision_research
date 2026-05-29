@@ -1,0 +1,93 @@
+[
+    {
+        "t": 0.5,
+        "action": "set_fps",
+        "value": 60
+    },
+    {
+        "t": 1.0,
+        "action": "press",
+        "key": "q"
+    },
+    {
+        "t": 2.5,
+        "action": "screenshot",
+        "path": "pybullet/_shots/shot_t02s_jog_q.png"
+    },
+    {
+        "t": 3.0,
+        "action": "release",
+        "key": "q"
+    },
+    {
+        "t": 3.5,
+        "action": "press",
+        "key": "1"
+    },
+    {
+        "t": 3.5,
+        "action": "press",
+        "key": "e"
+    },
+    {
+        "t": 5.0,
+        "action": "screenshot",
+        "path": "pybullet/_shots/shot_t05s_jog_1_e.png"
+    },
+    {
+        "t": 5.5,
+        "action": "release",
+        "key": "1"
+    },
+    {
+        "t": 5.5,
+        "action": "release",
+        "key": "e"
+    },
+    {
+        "t": 6.0,
+        "action": "resize",
+        "w": 1200,
+        "h": 650
+    },
+    {
+        "t": 7.0,
+        "action": "resize",
+        "w": 1400,
+        "h": 720
+    },
+    {
+        "t": 7.5,
+        "action": "press",
+        "key": "a"
+    },
+    {
+        "t": 9.0,
+        "action": "release",
+        "key": "a"
+    },
+    {
+        "t": 9.5,
+        "action": "set_fps",
+        "value": 90
+    },
+    {
+        "t": 10.0,
+        "action": "press",
+        "key": "w"
+    },
+    {
+        "t": 10.8,
+        "action": "screenshot",
+        "path": "pybullet/_shots/shot_t11s_jog_w.png"
+    },
+    {
+        "t": 11.0,
+        "action": "release",
+        "key": "w"
+    },
+    {
+        "t": 11.5,
+        "action": "quit"
+    }
+]
