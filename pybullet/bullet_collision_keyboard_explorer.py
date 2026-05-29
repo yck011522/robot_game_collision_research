@@ -47,6 +47,7 @@ Usage
 
 from __future__ import annotations
 
+import datetime
 import json
 import math
 import os
@@ -63,6 +64,21 @@ from compas_fab.backends.exceptions import CollisionCheckError
 HERE = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(HERE, "robot_cell_and_state.json")
 DISCOVERY_PATH = os.path.join(HERE, "bullet_collision_pair_discovery.json")
+LOG_DIR = os.path.join(HERE, "explorer_logs")
+
+
+def _pack_bits(bits) -> int:
+    """Pack a sequence of bools into a single integer (bit i = bits[i])."""
+    n = 0
+    for i, b in enumerate(bits):
+        if b:
+            n |= 1 << i
+    return n
+
+
+def unpack_bits(value: int, length: int) -> list[bool]:
+    """Inverse of _pack_bits. Public so the replay tool can import it."""
+    return [bool((value >> i) & 1) for i in range(length)]
 
 JOINT_NAMES = [
     "shoulder_pan_joint",
@@ -125,8 +141,6 @@ FWD_BAR_W = 700
 FWD_BAR_H = 44
 VEL_BAR_W = 240
 VEL_BAR_H = 38
-DIAG_BAR_W = 520
-DIAG_BAR_H = 18
 SLIDER_MIN_DEG = -180.0
 SLIDER_MAX_DEG = 180.0
 
@@ -346,8 +360,15 @@ class KeyboardExplorer:
         self.path_shape_var = tk.StringVar(value="linear")  # or "exponential"
         self.exp_k_var = tk.DoubleVar(value=3.0)  # exp clamp steepness
 
+        # Session log
+        self.session_log_f = None
+        self.session_log_path: str | None = None
+        self.session_t0 = time.perf_counter()
+        self.tick_n = 0
+
         self._build_ui()
         self._bind_keys()
+        self._open_session_log()
 
         # Apply initial pose to GUI
         self._push_pose_to_gui()
@@ -479,51 +500,31 @@ class KeyboardExplorer:
         )
         self.fwd_canvas.pack(side=tk.LEFT, padx=(8, 0))
 
-        # --- clamp diagnostics panel ---
+        # --- clamp diagnostics panel: 3 horizontal bars ---
         diag = ttk.LabelFrame(self.root, text="Clamp diagnostics", padding=(10, 6))
         diag.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(4, 0))
-        diag_rows = ttk.Frame(diag)
-        diag_rows.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.diag_path_canvas = None
-        self.diag_path_value = None
-        self.diag_prox_canvas = None
-        self.diag_prox_value = None
-        self.diag_speed_canvas = None
-        self.diag_speed_value = None
-
-        def add_diag_row(row_idx: int, label: str, fill_color: str):
-            ttk.Label(diag_rows, text=label, width=18, font=("Consolas", 9)).grid(
-                row=row_idx, column=0, sticky="w", padx=(0, 6), pady=2
+        self.diag_bars: dict[str, tuple[tk.Canvas, ttk.Label, str]] = {}
+        bar_specs = [
+            ("path", "Path clamp",       COLOR_AFTER_PATH),
+            ("prox", "Proximity clamp",  COLOR_VEL_FILL),
+            ("speed", "Speed (% of max)", COLOR_FREE),
+        ]
+        for key, label, color in bar_specs:
+            row = ttk.Frame(diag)
+            row.pack(side=tk.TOP, fill=tk.X, pady=1)
+            ttk.Label(row, text=label, width=18, font=("Consolas", 9)).pack(side=tk.LEFT)
+            c = tk.Canvas(
+                row, width=480, height=16, bg="#eeeeee",
+                highlightthickness=1, highlightbackground="#888888",
             )
-            canvas = tk.Canvas(
-                diag_rows,
-                width=DIAG_BAR_W,
-                height=DIAG_BAR_H,
-                bg="#eeeeee",
-                highlightthickness=1,
-                highlightbackground="#888888",
-            )
-            canvas.grid(row=row_idx, column=1, sticky="w", pady=2)
-            val = ttk.Label(diag_rows, text="0.0%", width=8, font=("Consolas", 9))
-            val.grid(row=row_idx, column=2, sticky="w", padx=(8, 0), pady=2)
-            return canvas, val, fill_color
-
-        (
-            self.diag_path_canvas,
-            self.diag_path_value,
-            self.diag_path_color,
-        ) = add_diag_row(0, "Path clamp %", "#ff9020")
-        (
-            self.diag_prox_canvas,
-            self.diag_prox_value,
-            self.diag_prox_color,
-        ) = add_diag_row(1, "Prox clamp %", "#3f8b4f")
-        (
-            self.diag_speed_canvas,
-            self.diag_speed_value,
-            self.diag_speed_color,
-        ) = add_diag_row(2, "Speed % max", "#4f9fd6")
+            c.pack(side=tk.LEFT, padx=(4, 4))
+            vlbl = ttk.Label(row, text="--", width=10, font=("Consolas", 9), anchor="w")
+            vlbl.pack(side=tk.LEFT)
+            self.diag_bars[key] = (c, vlbl, color)
+        self.diag_detail = ttk.Label(
+            diag, text="", font=("Consolas", 8), foreground="#444444"
+        )
+        self.diag_detail.pack(side=tk.TOP, anchor="w", pady=(2, 0))
 
         # --- controls ---
         ctl = ttk.LabelFrame(self.root, text="Controls", padding=(10, 6))
@@ -614,6 +615,113 @@ class KeyboardExplorer:
 
         var.trace_add("write", upd)
         upd()
+
+    # ------------------------------------------------------------- keyboard
+
+    def _open_session_log(self) -> None:
+        """Open a JSON-Lines log file for this session and write the header line.
+
+        The header captures all constants that the replay tool needs to
+        reconstruct each tick. Subsequent lines are per-tick rows written
+        from `_write_log_tick`.
+        """
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(LOG_DIR, "session_{}.jsonl".format(ts))
+            f = open(path, "w", encoding="utf-8", buffering=1)  # line-buffered
+            header = {
+                "header": True,
+                "version": 1,
+                "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "joint_names": list(JOINT_NAMES),
+                "initial_pos_deg": list(INITIAL_POS_DEG),
+                "joint_limits_deg": [
+                    [math.degrees(lo), math.degrees(hi)] for lo, hi in self.joint_limits
+                ],
+                "n_forward_steps": N_FORWARD_STEPS,
+                "forward_step_deg": FORWARD_STEP_DEG,
+                "probe_half_deg": PROBE_HALF_DEG,
+                "probe_offsets_deg": list(PROBE_OFFSETS_DEG),
+                "keys": {
+                    "fast_pos": list(FAST_POS_KEYS),
+                    "slow_pos": list(SLOW_POS_KEYS),
+                    "slow_neg": list(SLOW_NEG_KEYS),
+                    "fast_neg": list(FAST_NEG_KEYS),
+                },
+                "defaults": {
+                    "max_vel_dps": list(DEFAULT_MAX_VEL_DPS),
+                    "max_accel_dps2": list(DEFAULT_MAX_ACCEL_DPS2),
+                    "slow_dps": DEFAULT_SLOW_DPS,
+                    "fast_dps": DEFAULT_FAST_DPS,
+                    "prox_floor_pct": DEFAULT_PROX_FLOOR_PCT,
+                    "path_cutoff_deg": DEFAULT_PATH_CUTOFF_DEG,
+                    "target_fps": DEFAULT_FPS,
+                },
+            }
+            f.write(json.dumps(header) + "\n")
+            self.session_log_f = f
+            self.session_log_path = path
+            print("Logging session ticks to:", path)
+        except Exception as exc:
+            print("Could not open session log:", exc, file=sys.stderr)
+            self.session_log_f = None
+
+    def _write_log_tick(self, final_scalar: float) -> None:
+        if self.session_log_f is None:
+            return
+        try:
+            row = {
+                "n": self.tick_n,
+                "t": round(time.perf_counter() - self.session_t0, 6),
+                "dt": round(self.last_tick_dt, 6),
+                "keys": sorted(self.pressed),
+                "v_des": [round(math.degrees(v), 4) for v in self.v_des_rad],
+                "v_cmd": [round(math.degrees(v), 4) for v in self.v_cmd_rad],
+                "v_out": [round(math.degrees(v), 4) for v in self.v_out_rad],
+                "pos":   [round(math.degrees(v), 4) for v in self.pos_rad],
+                "vel":   [round(math.degrees(v), 4) for v in self.vel_rad],
+                "in_coll": (
+                    None if self.current_in_coll is None else bool(self.current_in_coll)
+                ),
+                "ps": round(self.last_path_scalar, 6),
+                "qs": round(self.last_prox_scalar, 6),
+                "fs": round(final_scalar, 6),
+                "p_near": (
+                    None if self.path_nearest_deg is None
+                    else round(self.path_nearest_deg, 3)
+                ),
+                "q_near": (
+                    None if self.prox_nearest_deg is None
+                    else round(self.prox_nearest_deg, 3)
+                ),
+                "fwd": _pack_bits(self.fwd_result),
+                "prox": [_pack_bits(r) for r in self.prox_results],
+                "cfg": {
+                    "mv": [round(v.get(), 3) for v in self.max_vel_vars],
+                    "ma": [round(v.get(), 3) for v in self.max_accel_vars],
+                    "slow": round(self.slow_var.get(), 3),
+                    "fast": round(self.fast_var.get(), 3),
+                    "pf":   round(self.prox_floor_var.get(), 3),
+                    "pc":   round(self.path_cutoff_var.get(), 3),
+                    "sh":   self.path_shape_var.get(),
+                    "ek":   round(self.exp_k_var.get(), 3),
+                    "fps":  round(self.target_fps_var.get(), 1),
+                },
+            }
+            self.session_log_f.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            print("Log write error:", exc, file=sys.stderr)
+
+    def close_log(self) -> None:
+        if self.session_log_f is not None:
+            try:
+                self.session_log_f.close()
+            except Exception:
+                pass
+            self.session_log_f = None
+            if self.session_log_path:
+                print("Session log closed:", self.session_log_path)
 
     # ------------------------------------------------------------- keyboard
 
@@ -902,6 +1010,8 @@ class KeyboardExplorer:
             self._draw_vel(i)
         self._draw_fwd()
         self._write_diag()
+        self._write_log_tick(final_scalar)
+        self.tick_n += 1
 
         # 9. Schedule next tick to hit target FPS
         target_dt_ms = int(max(1, 1000.0 / max(1.0, target)))
@@ -1020,46 +1130,45 @@ class KeyboardExplorer:
                     break
 
     def _write_diag(self) -> None:
-        """Draw per-tick diagnostics bars for path/prox clamp and speed."""
-
-        def draw_percent_bar(canvas: tk.Canvas, value_label: ttk.Label, frac: float, fill: str):
-            frac = max(0.0, min(1.0, frac))
-            canvas.delete("all")
-            w = DIAG_BAR_W
-            h = DIAG_BAR_H
-            # Background lane
-            canvas.create_rectangle(0, 0, w, h, fill="#e3e3e3", outline="")
-            # 25/50/75% ticks
-            for t in (0.25, 0.5, 0.75):
-                x = t * w
-                canvas.create_line(x, 0, x, h, fill="#b3b3b3", dash=(2, 2))
-            # Filled portion
-            canvas.create_rectangle(0, 0, frac * w, h, fill=fill, outline="")
-            value_label.config(text="{:5.1f}%".format(frac * 100.0))
-
+        """Update the three horizontal diagnostic bars + one detail line."""
         v_out_norm = math.sqrt(sum(v * v for v in self.v_out_rad))
-        max_speed_norm = math.sqrt(
-            sum(math.radians(max(0.0, v.get())) ** 2 for v in self.max_vel_vars)
+        max_vel_rad = [math.radians(v.get()) for v in self.max_vel_vars]
+        max_vel_norm = math.sqrt(sum(v * v for v in max_vel_rad))
+        speed_frac = (v_out_norm / max_vel_norm) if max_vel_norm > 1e-9 else 0.0
+        values = {
+            "path": self.last_path_scalar,
+            "prox": self.last_prox_scalar,
+            "speed": min(1.0, max(0.0, speed_frac)),
+        }
+        for key, (canvas, vlbl, color) in self.diag_bars.items():
+            canvas.delete("all")
+            w = int(canvas["width"])
+            h = int(canvas["height"])
+            frac = max(0.0, min(1.0, values[key]))
+            canvas.create_rectangle(0, 0, int(w * frac), h, fill=color, outline="")
+            for f in (0.25, 0.5, 0.75):
+                x = int(w * f)
+                canvas.create_line(x, 0, x, h, fill="#bbbbbb")
+            canvas.create_rectangle(0, 0, w - 1, h - 1, outline="#666666")
+            vlbl.config(text="{:6.1%}".format(values[key]))
+        v_cmd_norm_dps = math.degrees(math.sqrt(sum(v * v for v in self.v_cmd_rad)))
+        v_out_norm_dps = math.degrees(v_out_norm)
+        prox_d = (
+            "--" if self.prox_nearest_deg is None
+            else "{:.0f} deg".format(self.prox_nearest_deg)
         )
-        speed_frac = 0.0 if max_speed_norm <= 1e-9 else v_out_norm / max_speed_norm
-
-        draw_percent_bar(
-            self.diag_path_canvas,
-            self.diag_path_value,
-            self.last_path_scalar,
-            self.diag_path_color,
+        path_d = (
+            "--" if self.path_nearest_deg is None
+            else "{:.1f} deg".format(self.path_nearest_deg)
         )
-        draw_percent_bar(
-            self.diag_prox_canvas,
-            self.diag_prox_value,
-            self.last_prox_scalar,
-            self.diag_prox_color,
-        )
-        draw_percent_bar(
-            self.diag_speed_canvas,
-            self.diag_speed_value,
-            speed_frac,
-            self.diag_speed_color,
+        self.diag_detail.config(
+            text=(
+                "nearest prox = {pd:>8s}   nearest path = {ad:>8s}   "
+                "|v_cmd| = {vc:5.1f} dps   |v_out| = {vo:5.1f} dps   shape = {sh}".format(
+                    pd=prox_d, ad=path_d, vc=v_cmd_norm_dps, vo=v_out_norm_dps,
+                    sh=self.path_shape_var.get(),
+                )
+            )
         )
 
     def _draw_vel(self, idx: int) -> None:
@@ -1190,6 +1299,10 @@ def main() -> None:
     def on_close():
         print("Shutting down ...")
         try:
+            app.close_log()
+        except Exception:
+            pass
+        try:
             executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
@@ -1203,6 +1316,10 @@ def main() -> None:
     try:
         root.mainloop()
     finally:
+        try:
+            app.close_log()
+        except Exception:
+            pass
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
