@@ -1,15 +1,15 @@
 {
   "meta": {
     "base_seed": 12345,
-    "duration_per_worker_s": 5.0,
-    "generated": "2026-05-29T11:42:24",
+    "duration_per_worker_s": 60.0,
+    "generated": "2026-05-29T11:48:02",
     "totals": {
-      "distinct_pairs": 55,
-      "n_checks": 5850,
-      "n_collisions": 3598,
-      "n_pairs_total": 14230
+      "distinct_pairs": 57,
+      "n_checks": 61793,
+      "n_collisions": 38347,
+      "n_pairs_total": 152897
     },
-    "wall_s": 12.687963800000944,
+    "wall_s": 67.38638440000068,
     "workers": 10
   },
   "observed_pairs": [
@@ -29,6 +29,7 @@
     "body:left_player <-> link:wrist_2_link",
     "body:left_player <-> link:wrist_3_link",
     "body:left_player <-> tool:Bucket",
+    "body:left_wall <-> link:wrist_2_link",
     "body:left_wall <-> link:wrist_3_link",
     "body:left_wall <-> tool:Bucket",
     "body:mid_player <-> link:forearm_link",
@@ -52,6 +53,7 @@
     "body:right_player <-> link:wrist_2_link",
     "body:right_player <-> link:wrist_3_link",
     "body:right_player <-> tool:Bucket",
+    "body:right_wall <-> link:wrist_2_link",
     "body:right_wall <-> link:wrist_3_link",
     "body:right_wall <-> tool:Bucket",
     "link:base_link_inertia <-> link:forearm_link",
@@ -164,10 +166,12 @@
         "buckets",
         "ground",
         "left_player",
+        "left_wall",
         "mid_player",
         "pedestal",
         "pyramid_ground",
-        "right_player"
+        "right_player",
+        "right_wall"
       ],
       "collided_with_links": [
         "base_link_inertia",
@@ -363,6 +367,7 @@
     "left_wall": {
       "collided_with_bodies": [],
       "collided_with_links": [
+        "wrist_2_link",
         "wrist_3_link"
       ],
       "collided_with_tools": [
@@ -389,8 +394,7 @@
         "shoulder_link",
         "tool0",
         "upper_arm_link",
-        "wrist_1_link",
-        "wrist_2_link"
+        "wrist_1_link"
       ]
     },
     "mid_player": {
@@ -528,6 +532,7 @@
     "right_wall": {
       "collided_with_bodies": [],
       "collided_with_links": [
+        "wrist_2_link",
         "wrist_3_link"
       ],
       "collided_with_tools": [
@@ -554,8 +559,7 @@
         "shoulder_link",
         "tool0",
         "upper_arm_link",
-        "wrist_1_link",
-        "wrist_2_link"
+        "wrist_1_link"
       ]
     }
   },

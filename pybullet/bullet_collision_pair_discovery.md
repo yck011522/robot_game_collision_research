@@ -1,6 +1,6 @@
 # Collision pair discovery
 
-Generated: 2026-05-29T11:42:24
+Generated: 2026-05-29T11:48:02
 
 
 ## Run
@@ -8,28 +8,28 @@ Generated: 2026-05-29T11:42:24
 - Platform: `Windows-11-10.0.26200-SP0`
 - Python: `3.12.13`
 - Workers (processes): **10**
-- Per-worker duration: **5.0 s**
-- Wall time (incl. setup): **12.69 s**
-- Total checks: **5850**
-- Total collisions: **3598** (61.5%)
-- Total reported pair-instances: **14230**
-- Distinct pairs observed: **55**
-- Sampling check rate: **461 configs/s aggregate**
+- Per-worker duration: **60.0 s**
+- Wall time (incl. setup): **67.39 s**
+- Total checks: **61793**
+- Total collisions: **38347** (62.1%)
+- Total reported pair-instances: **152897**
+- Distinct pairs observed: **57**
+- Sampling check rate: **917 configs/s aggregate**
 
 ### Per-worker stats
 
 | pid | checks | collisions | pair-instances | distinct pairs |
 |----:|-------:|-----------:|---------------:|---------------:|
-| 18324 | 560 | 343 | 1392 | 49 |
-| 23792 | 587 | 356 | 1388 | 47 |
-| 3744 | 588 | 359 | 1297 | 47 |
-| 25880 | 593 | 381 | 1474 | 50 |
-| 30312 | 595 | 361 | 1452 | 49 |
-| 21736 | 566 | 361 | 1512 | 47 |
-| 27140 | 576 | 362 | 1494 | 48 |
-| 25084 | 594 | 365 | 1440 | 46 |
-| 23908 | 592 | 345 | 1333 | 48 |
-| 23128 | 599 | 365 | 1448 | 49 |
+| 30240 | 6111 | 3764 | 15022 | 55 |
+| 24164 | 6234 | 3832 | 15033 | 53 |
+| 32488 | 6238 | 3901 | 15113 | 54 |
+| 5984 | 6128 | 3833 | 15342 | 55 |
+| 32112 | 6133 | 3782 | 15096 | 56 |
+| 5484 | 6194 | 3863 | 15600 | 55 |
+| 12460 | 6136 | 3836 | 15508 | 53 |
+| 21972 | 6188 | 3874 | 15642 | 54 |
+| 32028 | 6202 | 3818 | 15242 | 55 |
+| 29348 | 6229 | 3844 | 15299 | 57 |
 
 ## Caveat
 
@@ -66,16 +66,16 @@ Pairs that did NOT appear in this run are **unobserved**, not proven unreachable
 
 ### `left_wall`
 
-- Collided with links: `['wrist_3_link']`
+- Collided with links: `['wrist_2_link', 'wrist_3_link']`
 - Collided with other bodies/tools: `['tool:Bucket']`
-- **`touch_links_candidates` (never seen):** `['base', 'base_link', 'base_link_inertia', 'flange', 'forearm_link', 'shoulder_link', 'tool0', 'upper_arm_link', 'wrist_1_link', 'wrist_2_link']`
+- **`touch_links_candidates` (never seen):** `['base', 'base_link', 'base_link_inertia', 'flange', 'forearm_link', 'shoulder_link', 'tool0', 'upper_arm_link', 'wrist_1_link']`
 - **`touch_bodies_candidates` (never seen):** `['bucket_ground', 'buckets', 'front_wall', 'ground', 'left_player', 'mid_player', 'pedestal', 'pyramid_ground', 'right_player', 'right_wall']`
 
 ### `right_wall`
 
-- Collided with links: `['wrist_3_link']`
+- Collided with links: `['wrist_2_link', 'wrist_3_link']`
 - Collided with other bodies/tools: `['tool:Bucket']`
-- **`touch_links_candidates` (never seen):** `['base', 'base_link', 'base_link_inertia', 'flange', 'forearm_link', 'shoulder_link', 'tool0', 'upper_arm_link', 'wrist_1_link', 'wrist_2_link']`
+- **`touch_links_candidates` (never seen):** `['base', 'base_link', 'base_link_inertia', 'flange', 'forearm_link', 'shoulder_link', 'tool0', 'upper_arm_link', 'wrist_1_link']`
 - **`touch_bodies_candidates` (never seen):** `['bucket_ground', 'buckets', 'front_wall', 'ground', 'left_player', 'left_wall', 'mid_player', 'pedestal', 'pyramid_ground', 'right_player']`
 
 ### `pedestal`
@@ -134,8 +134,8 @@ Pairs that did NOT appear in this run are **unobserved**, not proven unreachable
 | `ground` | . | . | . | . | X | X | X | X | . | . | . |
 | `buckets` | . | . | . | . | X | X | X | X | . | . | . |
 | `bucket_ground` | . | . | . | . | . | . | . | . | . | . | . |
-| `left_wall` | . | . | . | . | . | . | . | X | . | . | . |
-| `right_wall` | . | . | . | . | . | . | . | X | . | . | . |
+| `left_wall` | . | . | . | . | . | . | X | X | . | . | . |
+| `right_wall` | . | . | . | . | . | . | X | X | . | . | . |
 | `pedestal` | . | . | . | X | X | . | X | X | . | . | . |
 | `pyramid_ground` | . | . | . | X | X | X | X | X | . | . | . |
 | `right_player` | . | . | . | . | X | X | X | X | . | . | . |
@@ -168,6 +168,7 @@ Sorted alphabetically. Each entity tagged with kind (`link:`, `body:`, `tool:`).
 - `body:left_player`  <->  `link:wrist_2_link`
 - `body:left_player`  <->  `link:wrist_3_link`
 - `body:left_player`  <->  `tool:Bucket`
+- `body:left_wall`  <->  `link:wrist_2_link`
 - `body:left_wall`  <->  `link:wrist_3_link`
 - `body:left_wall`  <->  `tool:Bucket`
 - `body:mid_player`  <->  `link:forearm_link`
@@ -191,6 +192,7 @@ Sorted alphabetically. Each entity tagged with kind (`link:`, `body:`, `tool:`).
 - `body:right_player`  <->  `link:wrist_2_link`
 - `body:right_player`  <->  `link:wrist_3_link`
 - `body:right_player`  <->  `tool:Bucket`
+- `body:right_wall`  <->  `link:wrist_2_link`
 - `body:right_wall`  <->  `link:wrist_3_link`
 - `body:right_wall`  <->  `tool:Bucket`
 - `link:base_link_inertia`  <->  `link:forearm_link`
