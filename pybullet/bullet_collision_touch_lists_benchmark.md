@@ -1,6 +1,6 @@
 # Touch-list benchmark: baseline vs discovered touch lists (N sweep)
 
-Generated: 2026-05-29T12:17:48
+Generated: 2026-05-29T15:51:31
 
 
 ## Host
@@ -33,12 +33,12 @@ Generated: 2026-05-29T12:17:48
 
 | N | base_hz | touch_hz | speedup | base_wall_s | touch_wall_s | wall_save | sanity |
 |--:|--------:|---------:|--------:|------------:|-------------:|----------:|:-------|
-| 2 | 333.2 | 384.7 | 1.15x | 15.01 | 13.00 | +13.4% | OK |
-| 4 | 750.7 | 761.2 | 1.01x | 6.66 | 6.57 | +1.4% | OK |
-| 6 | 858.5 | 872.1 | 1.02x | 5.82 | 5.73 | +1.6% | OK |
-| 8 | 973.9 | 1033.0 | 1.06x | 5.13 | 4.84 | +5.7% | OK |
-| 10 | 1023.9 | 1063.2 | 1.04x | 4.88 | 4.70 | +3.7% | OK |
-| 12 | 614.1 | 863.9 | 1.41x | 8.14 | 5.79 | +28.9% | OK |
+| 2 | 1212.5 | 1536.3 | 1.27x | 4.12 | 3.25 | +21.1% | OK |
+| 4 | 2128.9 | 2631.1 | 1.24x | 2.35 | 1.90 | +19.1% | OK |
+| 6 | 2612.6 | 3215.6 | 1.23x | 1.91 | 1.55 | +18.8% | OK |
+| 8 | 2912.6 | 3492.1 | 1.20x | 1.72 | 1.43 | +16.6% | OK |
+| 10 | 2897.3 | 3418.2 | 1.18x | 1.73 | 1.46 | +15.2% | OK |
+| 12 | 2593.3 | 3420.0 | 1.32x | 1.93 | 1.46 | +24.2% | OK |
 
 ## Per-N detail
 
@@ -48,53 +48,53 @@ Generated: 2026-05-29T12:17:48
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 333.2 | 166.6 | 15.01 | 3479 | 0.0% |
-| with_touch | 384.7 | 192.4 | 13.00 | 3479 | 0.1% |
+| baseline | 1212.5 | 606.3 | 4.12 | 3479 | 0.3% |
+| with_touch | 1536.3 | 768.2 | 3.25 | 3479 | 0.1% |
 
 ### N = 4
 
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 750.7 | 187.7 | 6.66 | 3479 | 0.4% |
-| with_touch | 761.2 | 190.3 | 6.57 | 3479 | 1.0% |
+| baseline | 2128.9 | 532.2 | 2.35 | 3479 | 1.7% |
+| with_touch | 2631.1 | 657.8 | 1.90 | 3479 | 0.5% |
 
 ### N = 6
 
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 858.5 | 143.1 | 5.82 | 3479 | 2.5% |
-| with_touch | 872.1 | 145.3 | 5.73 | 3479 | 1.1% |
+| baseline | 2612.6 | 435.4 | 1.91 | 3479 | 8.2% |
+| with_touch | 3215.6 | 535.9 | 1.55 | 3479 | 11.4% |
 
 ### N = 8
 
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 973.9 | 121.7 | 5.13 | 3479 | 4.6% |
-| with_touch | 1033.0 | 129.1 | 4.84 | 3479 | 3.1% |
+| baseline | 2912.6 | 364.1 | 1.72 | 3479 | 6.9% |
+| with_touch | 3492.1 | 436.5 | 1.43 | 3479 | 11.5% |
 
 ### N = 10
 
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 1023.9 | 102.4 | 4.88 | 3479 | 3.7% |
-| with_touch | 1063.2 | 106.3 | 4.70 | 3479 | 5.0% |
+| baseline | 2897.3 | 289.7 | 1.73 | 3479 | 8.5% |
+| with_touch | 3418.2 | 341.8 | 1.46 | 3479 | 15.3% |
 
 ### N = 12
 
 - Sanity: OK (3479 colliding configs)
 | scenario | total_hz | per_inst_hz | wall_s | collisions | imbal% |
 |:---------|---------:|------------:|-------:|-----------:|-------:|
-| baseline | 614.1 | 51.2 | 8.14 | 3479 | 11.2% |
-| with_touch | 863.9 | 72.0 | 5.79 | 3479 | 16.0% |
+| baseline | 2593.3 | 216.1 | 1.93 | 3479 | 27.6% |
+| with_touch | 3420.0 | 285.0 | 1.46 | 3479 | 22.1% |
 
 ## Summary
 
-- **Best speedup:** 1.41x at N=12
-- **Worst speedup:** 1.01x at N=4
+- **Best speedup:** 1.32x at N=12
+- **Worst speedup:** 1.18x at N=10
 - A speedup < 1.0 means the touch-list bookkeeping cost exceeds the pair-check cost it saves for that worker count.
 
 ## Notes
