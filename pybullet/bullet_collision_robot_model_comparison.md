@@ -14,20 +14,20 @@ Comparison of collision-check throughput between the JSON-embedded UR10e baselin
 
 | variant | mode | N | collisions | setup_s | total_s | check_hz | mean_ms | p50_ms | p95_ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| json_ur10e | fail_fast | 2000 | 1241 | 0.912 | 9.866 | 202.72 | 4.9257 | 4.8147 | 7.1510 |
-| json_ur10e | full_report | 2000 | 1241 | 0.954 | 10.846 | 184.40 | 5.4158 | 5.1762 | 6.1992 |
-| assets_ur10e | fail_fast | 2000 | 1241 | 0.869 | 9.281 | 215.50 | 4.6338 | 4.5984 | 5.4763 |
-| assets_ur10e | full_report | 2000 | 1241 | 0.866 | 10.868 | 184.02 | 5.4270 | 5.2399 | 5.9784 |
-| assets_ur12e | fail_fast | 2000 | 1277 | 0.892 | 9.226 | 216.78 | 4.6065 | 4.4851 | 5.5563 |
-| assets_ur12e | full_report | 2000 | 1277 | 0.791 | 10.629 | 188.17 | 5.3074 | 5.0999 | 5.9317 |
+| json_ur10e | fail_fast | 2000 | 1250 | 0.938 | 2.946 | 678.81 | 1.4694 | 1.4458 | 2.0304 |
+| json_ur10e | full_report | 2000 | 1250 | 0.895 | 4.052 | 493.58 | 2.0221 | 1.9522 | 2.4325 |
+| assets_ur10e | fail_fast | 2000 | 1250 | 0.870 | 2.928 | 682.96 | 1.4605 | 1.4342 | 2.0220 |
+| assets_ur10e | full_report | 2000 | 1250 | 0.843 | 4.035 | 495.65 | 2.0137 | 1.9507 | 2.4200 |
+| assets_ur12e | fail_fast | 2000 | 1284 | 0.771 | 2.775 | 720.66 | 1.3840 | 1.3514 | 1.9582 |
+| assets_ur12e | full_report | 2000 | 1284 | 0.770 | 3.871 | 516.64 | 1.9317 | 1.8643 | 2.2541 |
 
 ## Speedup vs json_ur10e baseline
 
 | variant | fail_fast hz | x baseline | full_report hz | x baseline |
 |---|---:|---:|---:|---:|
-| json_ur10e | 202.72 | 1.000x | 184.40 | 1.000x |
-| assets_ur10e | 215.50 | 1.063x | 184.02 | 0.998x |
-| assets_ur12e | 216.78 | 1.069x | 188.17 | 1.020x |
+| json_ur10e | 678.81 | 1.000x | 493.58 | 1.000x |
+| assets_ur10e | 682.96 | 1.006x | 495.65 | 1.004x |
+| assets_ur12e | 720.66 | 1.062x | 516.64 | 1.047x |
 
 ## Notes
 
