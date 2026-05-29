@@ -1,15 +1,15 @@
 {
   "meta": {
     "base_seed": 12345,
-    "duration_per_worker_s": 60.0,
-    "generated": "2026-05-29T11:48:02",
+    "duration_per_worker_s": 600.0,
+    "generated": "2026-05-29T12:00:22",
     "totals": {
-      "distinct_pairs": 57,
-      "n_checks": 61793,
-      "n_collisions": 38347,
-      "n_pairs_total": 152897
+      "distinct_pairs": 58,
+      "n_checks": 633074,
+      "n_collisions": 393727,
+      "n_pairs_total": 1565265
     },
-    "wall_s": 67.38638440000068,
+    "wall_s": 608.7083698999995,
     "workers": 10
   },
   "observed_pairs": [
@@ -19,6 +19,7 @@
     "body:buckets <-> link:wrist_2_link",
     "body:buckets <-> link:wrist_3_link",
     "body:buckets <-> tool:Bucket",
+    "body:front_wall <-> tool:Bucket",
     "body:ground <-> link:forearm_link",
     "body:ground <-> link:wrist_1_link",
     "body:ground <-> link:wrist_2_link",
@@ -270,9 +271,10 @@
     "front_wall": {
       "collided_with_bodies": [],
       "collided_with_links": [],
-      "collided_with_tools": [],
+      "collided_with_tools": [
+        "Bucket"
+      ],
       "touch_bodies_candidates": [
-        "Bucket",
         "bucket_ground",
         "buckets",
         "ground",
@@ -568,6 +570,7 @@
       "collided_with_bodies": [
         "bucket_ground",
         "buckets",
+        "front_wall",
         "ground",
         "left_player",
         "left_wall",
@@ -584,9 +587,7 @@
         "upper_arm_link"
       ],
       "collided_with_tools": [],
-      "touch_bodies_candidates": [
-        "front_wall"
-      ],
+      "touch_bodies_candidates": [],
       "touch_links_candidates": [
         "base",
         "base_link",
