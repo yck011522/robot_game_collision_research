@@ -1,73 +1,24 @@
-"""Interactive collision explorer with per-joint local-gradient visualization.
+"""Interactive collision explorer using discovered touch lists.
 
-A small Tkinter app driving:
-  - one GUI PyBullet instance (visualises the robot at the current config and
-    reports whether the current pose is in collision)
-  - six headless PyBullet worker processes that, every UI tick, each test 20
-    nearby joint variations (their assigned joint, +/- 10 degrees at 1 deg
-    spacing) and return collision results
-  - a coloured "horizon" bar per joint showing the local collision landscape
-    around the current value (green = free, red = collision)
+Variant of ``bullet_collision_interactive_explorer.py`` that loads
+``bullet_collision_pair_discovery.json`` and patches every
+``RigidBodyState.touch_links`` / ``touch_bodies`` (and the tool states)
+with the pairs the discovery run never observed colliding. Both the GUI
+PyBullet client and every worker process apply the same patch, so all
+collision checks skip the never-observed pairs.
 
-================================================================
-ENGINEERING DECISIONS
-================================================================
-
-1. UI FRAMEWORK: Tkinter.  Built into Python, no extra dependency.  All UI
-   work happens on the main thread; PyBullet GUI also runs on the main
-   thread (PyBullet requires this on Windows).
-
-2. SLIDER RANGE: -180..+180 deg as requested.  Slider values are clamped
-   to the URDF joint limits before being sent to PyBullet.  Elbow has a
-   tighter limit (+/- 180 deg) so its slider can hit the edges; other
-   joints have wider URDF limits (+/- 360 deg) and the slider is the
-   limiting factor.
-
-3. PROBE LAYOUT: per joint we test 10 offsets on each side at 1 deg
-   spacing  (offsets = -10..-1 then +1..+10, 20 total).  Total work per
-   tick = 6 joints x 20 = 120 collision checks.  At ~5 ms/check on this
-   machine, sequential cost would be ~600 ms.  Distributed 1 chunk per
-   joint across 6 worker processes the elapsed time is roughly the
-   slowest single worker ~ 100 ms plus IPC, comfortably below the human
-   perceptual threshold for slider feedback.
-
-4. WORKER POOL: 6 persistent processes built once at startup with
-   ProcessPoolExecutor(initializer=_proc_initializer).  Each worker has
-   its own PyBullet engine, robot cell and warmup check.  Setup cost is
-   paid once at app launch (~ 2 s) and excluded from per-tick latency.
-
-5. STATIC CHUNKING (one chunk per joint): matches the workload exactly --
-   6 chunks for 6 workers, perfectly balanced.  Dynamic distribution is
-   not useful here because the chunks are equal-size and the per-joint
-   work is similar.
-
-6. THROTTLING: a single 'pending_futures' list.  A new batch is dispatched
-   only when (a) the slider state is dirty AND (b) the previous batch has
-   fully finished.  Dragging a slider fast queues up nothing; the UI
-   just shows results based on the most recently completed batch.  This
-   keeps the UI responsive and prevents work pile-up.
-
-7. CURRENT-POSE CHECK: the GUI PyBullet instance (also a planner) does
-   the single collision check for the current slider position.  Workers
-   only do the +/- variations.  This keeps the visualisation and the
-   "in collision now?" status decoupled from worker latency.
-
-8. VISUALISATION BAR: one Canvas per joint, drawn to scale across the
-   full +/- 180 deg slider range.  At the marker position 21 cells are
-   drawn (the 20 probes + the current cell).  The marker triangle is
-   coloured by the current-pose collision result (green or red).  Cells
-   outside the probed region are left grey.
-
-================================================================
+See ``bullet_collision_interactive_explorer.py`` for the design notes;
+this file only diverges in scene loading.
 
 Usage
 -----
     conda activate game
-    python pybullet/bullet_collision_interactive_explorer.py
+    python pybullet/bullet_collision_interactive_explorer_touch.py
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -76,13 +27,13 @@ import tkinter as tk
 from tkinter import ttk
 from concurrent.futures import ProcessPoolExecutor
 
-# CRITICAL: compas_fab before any code that could trigger a bare `import pybullet`.
 from compas.data import json_load
 from compas_fab.backends import PyBulletClient, PyBulletPlanner
 from compas_fab.backends.exceptions import CollisionCheckError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(HERE, "robot_cell_and_state.json")
+DISCOVERY_PATH = os.path.join(HERE, "bullet_collision_pair_discovery.json")
 
 JOINT_NAMES = [
     "shoulder_pan_joint",
@@ -93,20 +44,15 @@ JOINT_NAMES = [
     "wrist_3_joint",
 ]
 
-# Probe layout
-PROBE_HALF = 12  # degrees on each side
-PROBE_STEP_DEG = 1.0  # spacing (degrees)
-PROBE_OFFSETS_DEG = list(range(-PROBE_HALF, 0)) + list(
-    range(1, PROBE_HALF + 1)
-)  # 20 entries, excludes 0
+PROBE_HALF = 12
+PROBE_STEP_DEG = 1.0
+PROBE_OFFSETS_DEG = list(range(-PROBE_HALF, 0)) + list(range(1, PROBE_HALF + 1))
 PROBE_OFFSETS_RAD = [math.radians(d) for d in PROBE_OFFSETS_DEG]
 
-# UI tick
-TICK_MS = 33  # ~30 Hz UI refresh
+TICK_MS = 33
 SLIDER_MIN_DEG = -180.0
 SLIDER_MAX_DEG = 180.0
 
-# Visual
 BAR_WIDTH_PX = 720
 BAR_HEIGHT_PX = 50
 COLOR_BG = "#dddddd"
@@ -119,15 +65,68 @@ COLOR_MARKER_UNKNOWN = "#444444"
 
 
 # ---------------------------------------------------------------------------
-# Scene loading -- shared between GUI client and workers
+# Scene loading + touch-list patching
 # ---------------------------------------------------------------------------
 
 
-def load_scene():
+def _load_discovery():
+    with open(DISCOVERY_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _apply_touch_lists(robot_cell_state, discovery: dict) -> dict:
+    """Mutate robot_cell_state in place using discovered never-colliding pairs."""
+    per_body = discovery.get("per_rigid_body", {})
+    per_tool = discovery.get("per_tool", {})
+
+    n_bodies = 0
+    n_tools = 0
+    total_links = 0
+    total_bodies = 0
+
+    for key, info in per_body.items():
+        state = robot_cell_state.rigid_body_states.get(key)
+        if state is None:
+            continue
+        tl = list(info.get("touch_links_candidates", []))
+        tb = list(info.get("touch_bodies_candidates", []))
+        state.touch_links = tl
+        state.touch_bodies = tb
+        n_bodies += 1
+        total_links += len(tl)
+        total_bodies += len(tb)
+
+    if hasattr(robot_cell_state, "tool_states"):
+        for key, info in per_tool.items():
+            state = robot_cell_state.tool_states.get(key)
+            if state is None:
+                continue
+            tl = list(info.get("touch_links_candidates", []))
+            tb = list(info.get("touch_bodies_candidates", []))
+            if hasattr(state, "touch_links"):
+                state.touch_links = tl
+            if hasattr(state, "touch_bodies"):
+                state.touch_bodies = tb
+            n_tools += 1
+            total_links += len(tl)
+            total_bodies += len(tb)
+
+    return {
+        "n_bodies_patched": n_bodies,
+        "n_tools_patched": n_tools,
+        "total_touch_links": total_links,
+        "total_touch_bodies": total_bodies,
+    }
+
+
+def load_scene(apply_touch: bool = True):
     data = json_load(JSON_PATH)
     robot_cell = data["robot_cell"]
     robot_cell_state = data["robot_cell_state"]
     robot_cell.robot_model.attr.pop("transmission", None)
+    if apply_touch:
+        discovery = _load_discovery()
+        _apply_touch_lists(robot_cell_state, discovery)
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
     lower = [
         joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES
@@ -137,7 +136,7 @@ def load_scene():
 
 
 # ---------------------------------------------------------------------------
-# Worker -- one persistent PyBullet client per process
+# Worker
 # ---------------------------------------------------------------------------
 
 _PROC_STATE: dict = {}
@@ -148,7 +147,7 @@ def _proc_initializer() -> None:
         pass
 
     ns = _NS()
-    robot_cell, robot_cell_state, _, _ = load_scene()
+    robot_cell, robot_cell_state, _, _ = load_scene(apply_touch=True)
     client = PyBulletClient(connection_type="direct", verbose=False)
     client.__enter__()
     planner = PyBulletPlanner(client)
@@ -170,13 +169,6 @@ def _proc_ping(_):
 
 
 def _proc_check_variation(args):
-    """Run 20 collision checks varying a single joint around a base config.
-
-    Args:
-        (base_rad, joint_idx, offsets_rad)
-    Returns:
-        list[bool] of length len(offsets_rad).  True = collision.
-    """
     base_rad, joint_idx, offsets_rad = args
     ns = _PROC_STATE["ns"]
     planner = ns.planner
@@ -212,6 +204,7 @@ class ExplorerApp:
         gui_robot_cell,
         gui_robot_cell_state,
         joint_limits_rad,
+        patch_stats: dict,
     ):
         self.root = root
         self.executor = executor
@@ -219,14 +212,13 @@ class ExplorerApp:
         self.robot_cell = gui_robot_cell
         self.robot_cell_state = gui_robot_cell_state
         self.cfg = gui_robot_cell_state.robot_configuration.copy()
-        self.joint_limits = joint_limits_rad  # list of (lo, hi) in rad
+        self.joint_limits = joint_limits_rad
+        self.patch_stats = patch_stats
 
-        # State
         initial_deg = [
             math.degrees(v)
             for v in gui_robot_cell_state.robot_configuration.joint_values
         ]
-        # Clamp initial to slider range
         initial_deg = [max(SLIDER_MIN_DEG, min(SLIDER_MAX_DEG, d)) for d in initial_deg]
         self.slider_vars = [tk.DoubleVar(value=d) for d in initial_deg]
         self.value_labels: list[ttk.Label] = []
@@ -239,20 +231,15 @@ class ExplorerApp:
 
         self._build_ui()
 
-        # Wire slider callbacks AFTER UI is built (avoid firing during setup)
         for var in self.slider_vars:
             var.trace_add("write", lambda *_: self._on_slider_change())
 
-        # Kick off the first update
         self._tick()
 
-    # ----- UI construction -----
-
     def _build_ui(self) -> None:
-        self.root.title("UR10e collision explorer")
-        self.root.geometry("1300x520")
+        self.root.title("UR10e collision explorer (touch lists)")
+        self.root.geometry("1300x560")
 
-        # Status bar at top
         status_frame = ttk.Frame(self.root, padding=(10, 8))
         status_frame.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(status_frame, text="Current pose:", font=("Segoe UI", 11)).pack(
@@ -271,12 +258,31 @@ class ExplorerApp:
         self.latency_label = ttk.Label(status_frame, text="", font=("Consolas", 9))
         self.latency_label.pack(side=tk.LEFT)
 
-        # Legend
+        # Touch-list info bar
+        info_frame = ttk.Frame(self.root, padding=(10, 0))
+        info_frame.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(
+            info_frame,
+            text=(
+                "Touch lists active: {nb} bodies + {nt} tools patched, "
+                "{tl} touch_links + {tb} touch_bodies skipped per check  "
+                "(source: {f})".format(
+                    nb=self.patch_stats["n_bodies_patched"],
+                    nt=self.patch_stats["n_tools_patched"],
+                    tl=self.patch_stats["total_touch_links"],
+                    tb=self.patch_stats["total_touch_bodies"],
+                    f=os.path.basename(DISCOVERY_PATH),
+                )
+            ),
+            font=("Segoe UI", 9),
+            foreground="#2a6f3a",
+        ).pack(side=tk.LEFT)
+
         legend_frame = ttk.Frame(self.root, padding=(10, 0))
         legend_frame.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(
             legend_frame,
-            text="Bar shows local collision landscape (+/- 10 deg around current, 1 deg steps):",
+            text="Bar shows local collision landscape (+/- 12 deg around current, 1 deg steps):",
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
         for label, color in [
@@ -288,7 +294,6 @@ class ExplorerApp:
                 side=tk.LEFT, padx=2
             )
 
-        # One row per joint
         body = ttk.Frame(self.root, padding=(10, 6))
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -296,12 +301,10 @@ class ExplorerApp:
             row = ttk.Frame(body)
             row.pack(side=tk.TOP, fill=tk.X, pady=4)
 
-            # Joint label
             ttk.Label(
                 row, text="J{}: {}".format(i, name), width=24, font=("Consolas", 9)
             ).pack(side=tk.LEFT)
 
-            # Slider
             scale = ttk.Scale(
                 row,
                 from_=SLIDER_MIN_DEG,
@@ -312,12 +315,10 @@ class ExplorerApp:
             )
             scale.pack(side=tk.LEFT, padx=(0, 6))
 
-            # Numeric value
             lbl = ttk.Label(row, text="0.0", width=7, font=("Consolas", 9), anchor="e")
             lbl.pack(side=tk.LEFT, padx=(0, 8))
             self.value_labels.append(lbl)
 
-            # Bar canvas
             canvas = tk.Canvas(
                 row,
                 width=BAR_WIDTH_PX,
@@ -329,7 +330,6 @@ class ExplorerApp:
             canvas.pack(side=tk.LEFT)
             self.bar_canvases.append(canvas)
 
-        # Buttons row at the bottom
         btn_frame = ttk.Frame(self.root, padding=(10, 8))
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Button(
@@ -345,12 +345,8 @@ class ExplorerApp:
             foreground="#666666",
         ).pack(side=tk.RIGHT)
 
-    # ----- Slider helpers -----
-
     def _on_slider_change(self) -> None:
-        # Just mark dirty; the tick decides when to dispatch.
         self.dirty = True
-        # Update numeric label and force-clear stale bar results immediately
         for i, var in enumerate(self.slider_vars):
             self.value_labels[i].config(text="{:+.1f} deg".format(var.get()))
 
@@ -364,11 +360,8 @@ class ExplorerApp:
         for var in self.slider_vars:
             var.set(0.0)
 
-    # ----- Main tick -----
-
     def _tick(self) -> None:
         try:
-            # 1) Harvest completed worker batch
             if self.pending_futures and all(f.done() for f in self.pending_futures):
                 try:
                     self.last_results = [f.result() for f in self.pending_futures]
@@ -384,20 +377,14 @@ class ExplorerApp:
                 self._redraw_all_bars()
                 self._update_latency_label()
 
-            # 2) If dirty and worker pool is free, dispatch a new batch
             if self.dirty and not self.pending_futures:
                 self.dirty = False
                 base_rad = [math.radians(v.get()) for v in self.slider_vars]
-                # Clamp to URDF joint limits before sending
                 base_rad = [
                     max(lo, min(hi, v))
                     for v, (lo, hi) in zip(base_rad, self.joint_limits)
                 ]
-
-                # Update the GUI client + current-pose collision status
                 self._update_gui_pybullet(base_rad)
-
-                # Submit one chunk per joint
                 chunks = [(tuple(base_rad), i, PROBE_OFFSETS_RAD) for i in range(6)]
                 self._batch_start_t = time.perf_counter()
                 self.pending_futures = [
@@ -405,8 +392,6 @@ class ExplorerApp:
                 ]
         finally:
             self.root.after(TICK_MS, self._tick)
-
-    # ----- GUI PyBullet update -----
 
     def _update_gui_pybullet(self, joint_values_rad: list) -> None:
         self.cfg.joint_values = list(joint_values_rad)
@@ -419,7 +404,6 @@ class ExplorerApp:
         except CollisionCheckError:
             self.current_in_coll = True
 
-        # Update status badge
         if self.current_in_coll:
             self.status_label.config(text="COLLISION", bg=COLOR_MARKER_COLL)
         else:
@@ -427,12 +411,10 @@ class ExplorerApp:
 
     def _update_latency_label(self) -> None:
         self.latency_label.config(
-            text="last batch: {:5.1f} ms  (120 checks across 6 workers)".format(
+            text="last batch: {:5.1f} ms  (120 checks across 6 workers, touch lists ON)".format(
                 self.last_batch_ms
             )
         )
-
-    # ----- Bar drawing -----
 
     def _redraw_all_bars(self) -> None:
         for i in range(6):
@@ -450,15 +432,12 @@ class ExplorerApp:
 
         cur_deg = self.slider_vars[idx].get()
 
-        # Background tick marks every 30 deg
         for d in range(-180, 181, 30):
             x = deg_to_x(d)
             canvas.create_line(x, h - 4, x, h, fill="#888888")
-        # Zero centre line
         x0 = deg_to_x(0)
         canvas.create_line(x0, 0, x0, h, fill="#aaaaaa", dash=(2, 3))
 
-        # Probe cells
         results = self.last_results[idx]
         for off_deg, result in zip(PROBE_OFFSETS_DEG, results):
             d = cur_deg + off_deg
@@ -472,7 +451,6 @@ class ExplorerApp:
                 color = COLOR_FREE
             canvas.create_rectangle(xa, 4, xb, h - 5, fill=color, outline="")
 
-        # Centre cell (current pose) -- coloured by overall status if known
         d = cur_deg
         xa = deg_to_x(d - 0.5 * PROBE_STEP_DEG)
         xb = deg_to_x(d + 0.5 * PROBE_STEP_DEG)
@@ -484,7 +462,6 @@ class ExplorerApp:
             color = COLOR_FREE
         canvas.create_rectangle(xa, 4, xb, h - 5, fill=color, outline="black")
 
-        # Triangle marker on top, pointing down
         cx = deg_to_x(cur_deg)
         if self.current_in_coll is None:
             mc = COLOR_MARKER_UNKNOWN
@@ -493,14 +470,7 @@ class ExplorerApp:
         else:
             mc = COLOR_MARKER_FREE
         canvas.create_polygon(
-            cx - 5,
-            -1,
-            cx + 5,
-            -1,
-            cx,
-            7,
-            fill=mc,
-            outline="black",
+            cx - 5, -1, cx + 5, -1, cx, 7, fill=mc, outline="black",
         )
 
 
@@ -510,14 +480,37 @@ class ExplorerApp:
 
 
 def _wait_for_workers(executor: ProcessPoolExecutor, n: int) -> None:
-    """Force all worker processes to finish their initializer before we start."""
     _ = list(executor.map(_proc_ping, range(n * 3)))
 
 
 def main() -> None:
-    print("Loading scene for GUI PyBullet instance ...")
-    robot_cell, robot_cell_state, lower, upper = load_scene()
+    if not os.path.exists(DISCOVERY_PATH):
+        raise SystemExit(
+            "Discovery JSON not found: {}\n  Run bullet_collision_pair_discovery.py first.".format(
+                DISCOVERY_PATH
+            )
+        )
+
+    print("Loading scene + applying touch lists for GUI PyBullet instance ...")
+    robot_cell, robot_cell_state, lower, upper = load_scene(apply_touch=True)
     joint_limits = list(zip(lower, upper))
+
+    # Recompute patch stats for the info banner (the discovery + state we loaded).
+    discovery = _load_discovery()
+    # Build a fresh state purely to count what gets patched (counts are
+    # independent of which copy we use, but using a throwaway avoids
+    # double-counting on already-patched lists if entries grow).
+    _, rcs_stats, _, _ = load_scene(apply_touch=False)
+    patch_stats = _apply_touch_lists(rcs_stats, discovery)
+    print(
+        "  touch lists applied: {nb} bodies, {nt} tools, "
+        "{tl} touch_links, {tb} touch_bodies".format(
+            nb=patch_stats["n_bodies_patched"],
+            nt=patch_stats["n_tools_patched"],
+            tl=patch_stats["total_touch_links"],
+            tb=patch_stats["total_touch_bodies"],
+        )
+    )
 
     print("Starting GUI PyBullet client ...")
     gui_client = PyBulletClient(connection_type="gui", verbose=False)
@@ -525,14 +518,13 @@ def main() -> None:
     gui_planner = PyBulletPlanner(gui_client)
     gui_planner.set_robot_cell(robot_cell)
     gui_planner.set_robot_cell_state(robot_cell_state)
-    # Warmup
     try:
         gui_planner.check_collision(robot_cell_state, options={"verbose": False})
     except CollisionCheckError:
         pass
 
     n_workers = 6
-    print("Spawning {} worker processes (one per joint) ...".format(n_workers))
+    print("Spawning {} worker processes (one per joint, touch lists ON) ...".format(n_workers))
     executor = ProcessPoolExecutor(max_workers=n_workers, initializer=_proc_initializer)
 
     print("Warming up workers ...")
@@ -548,6 +540,7 @@ def main() -> None:
         robot_cell,
         robot_cell_state,
         joint_limits,
+        patch_stats,
     )
 
     def on_close():
@@ -578,5 +571,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Required on Windows for ProcessPoolExecutor inside a __main__ guard.
     main()
