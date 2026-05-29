@@ -29,9 +29,9 @@ The program runs **three independent loops** that communicate through
 |------|----------------------|-------------|----------------|
 | **Input loop** | UI thread (Tk today, Pygame tomorrow) | event-driven | Read user input, build an immutable `IntentSnapshot`, atomically rebind it. |
 | **Control loop** | One dedicated background thread | configurable (default 60 Hz; achieved 25–35 Hz on Windows + Tk due to GIL) | Do all motion math, dispatch collision workers, integrate position, write the per-tick log. **No UI calls. No GUI-PyBullet calls.** |
-| **View loop** | UI thread, scheduled via the toolkit's timer | 10–30 Hz (default 15 Hz) | Read the latest control-thread state, repaint widgets, push the current pose to the visualisation backend. |
-| **Worker pool A** (forward) | N separate processes | one synchronous batch per control tick | Forward-path collision sweep. |
-| **Worker pool B** (proximity) | M separate processes | asynchronous, one batch at a time | Per-axis proximity probes. |
+| **View loop** | UI thread, scheduled via the toolkit's timer | 10–50 Hz (default 25 Hz) | Read the latest control-thread state, repaint widgets, push the current pose to the pyBullet 3D visualisation backend. |
+| **Forward scheduler queue** | Scheduler + shared worker processes | one synchronous batch per control tick | Forward-path collision sweep (safety-gate, high priority). |
+| **Proximity scheduler queue** | Scheduler + shared worker processes | asynchronous, one batch at a time | Per-axis proximity probes (soft slowdown, lower priority). |
 
 ### Why three loops, not one
 
@@ -46,14 +46,15 @@ all).
 The only thing the input loop hands to the control loop is an **immutable
 snapshot** containing:
 
-- Set of held keys / active commands (an opaque set; semantics live in the
-  control loop's mapping function).
-- Slow speed (deg/s), Fast speed (deg/s).
+- Set of held keys representing user input / active velocity commands (an opaque set; semantics live in the
+  control loop's mapping function). Those keys may represent Slow speed (deg/s) or Fast speed (deg/s). But in actual game, this is likely a scalar value per axis, not a set of keys.
+
+### Controller Configuration (tunable parameters)
 - Per-axis max velocity (deg/s, length-6 tuple).
 - Per-axis max acceleration (deg/s², length-6 tuple).
-- Proximity floor as a percentage (0..100).
-- Path-clamp cutoff distance (deg).
-- Path-clamp shape (`"linear"` or `"exponential"`) and an exponential
+- Proximity speed reduction floor as a percentage of full speed(0..100).
+- Forward-collision speed clamp cutoff distance (deg).
+- Forward-collision speed clamp shape (`"linear"` or `"exponential"`) and an exponential
   steepness `k`.
 - Target control FPS.
 
@@ -73,8 +74,8 @@ rewrite, use any atomic-pointer-swap primitive (`std::atomic<shared_ptr>` /
 - The close handler MUST be **idempotent** (it is called both from the
   window-close event and from a `finally:` around the UI main loop).
 - Close order: set stop → join control thread (≤ 2 s timeout) → dump metrics
-  → close log file → shut down both worker pools → close visualisation
-  client → destroy window.
+  → close log file → shut down collision worker processes/scheduler → close
+  visualisation client → destroy window.
 
 ---
 
@@ -86,7 +87,7 @@ Every control tick (target dt = 1 / target_fps), in order:
 2. **Harvest proximity.** If a previous async proximity batch has completed,
    collect its results and update the cached `prox_results`. Record the
    wall-clock pipeline time and the **age** of the data we are about to use.
-3. **Desired velocity.** Map the held-key set to a per-axis desired velocity
+3. **Desired velocity.** Map the held-key set or velocity input to a per-axis desired velocity
    vector `v_des` (deg/s, then converted to rad/s). The mapping is
    **algebraic per axis**: each key contributes ± slow or ± fast deg/s; held
    keys are summed; opposite keys cancel.
@@ -94,23 +95,23 @@ Every control tick (target dt = 1 / target_fps), in order:
    more than `max_accel[i] * dt`.
 5. **Per-axis velocity clamp.** Clamp each `v_cmd[i]` to ± `max_vel[i]`.
 6. **Synchronous forward check.** With `v_cmd` as the direction, dispatch
-   the forward sweep on worker pool A, **block until all chunks return**,
-   reassemble the ordered bool list. (See §3.) Skip if `|v_cmd|` is below a
-   small threshold (≈ 0.5 deg/s).
+  the forward sweep on the forward scheduler queue, **block until all
+  chunks return**,
+   reassemble the ordered bool list. (See §3.) Do not skip even if `|v_cmd|` is small.
 7. **Asynchronous proximity dispatch.** Submit a new proximity batch to
-   worker pool B for the current pose. If a batch is still in flight, **skip
+  the proximity scheduler queue for the current pose. If a batch is still in flight, **skip
    this dispatch** — do not queue. (See §3.)
-8. **Path clamp scalar** (see §4).
-9. **Proximity clamp scalar** (see §4).
+8. **Forward-collision speed clamp scalar** (see §4).
+9. **Proximity clamp scalar**  (see §4).
 10. **Apply the smaller scalar to the whole vector**: `v_out = v_cmd *
-    min(path_scalar, prox_scalar)`. The scalar is **global**, applied
+  min(forward_collision_scalar, prox_scalar)`. The scalar is **global**, applied
     uniformly to all six axes, so the direction the workers checked is
     exactly the direction the robot moves.
-11. **Integrate**: `pos += v_out * dt`, then clamp `pos` to joint limits and
+1.  **Integrate**: `pos += v_out * dt`, then clamp `pos` to joint limits and
     zero the velocity if it would push past a limit.
-12. **Record metrics** (control samples, intent log) and **write one log
+2.  **Record metrics** (control samples, intent log) and **write one log
     row** (see §6).
-13. **Pace.** Sleep `target_dt − elapsed`, waking early on stop.
+3.  **Pace.** Sleep `target_dt − elapsed`, waking early on stop.
 
 ### Pacing notes (Windows-specific)
 
@@ -127,26 +128,36 @@ acceptable on a 12-thread dev laptop with 5 worker processes per robot.
 Actual hardware (Intel Core Ultra 5 225, 10 cores) will change the optimal
 process counts; the architecture should not change.
 
-### 3.1 Two pools, not one
+### 3.1 Hybrid scheduler model (unified worker primitive + dual queues)
 
-- **Pool A — Forward / safety-gate.** Synchronous. Default 6 processes;
-  CLI-overridable. Production target: **3 per robot**.
-- **Pool B — Proximity / soft slowdown.** Asynchronous. Default 6
-  processes; CLI-overridable. Production target: **2 per robot**.
+The recommended rewrite model is:
 
-Two robots × 5 processes = 10 fits the production CPU exactly. Keeping the
-pools separate prevents proximity work (which can be a tick late without
-harm) from ever blocking the forward gate (which **must** complete every
-tick before motion is committed).
+- One **common collision worker primitive**:
+  `evaluate_batch(configs_6d) -> collision_flags`.
+- Two **separate scheduler queues**:
+  - **Forward collision check queue** (safety-gate, high priority).
+  - **Proximity queue** (soft slowdown, lower priority).
+- **Strict dequeue policy** at workers/scheduler:
+  always pull from the forward collision check queue first; only pull proximity work when the forward collision check queue is empty.
 
-### 3.2 Worker process initialisation
+This keeps the worker API clean and uniform while preserving the safety
+semantics that matter for control correctness and jitter control.
 
-Each worker, at start:
+For sizing, a production starting point remains effectively equivalent to the
+previous split (about 3 forward-equivalent + 2 proximity-equivalent workers
+per robot), but the exact assignment should be tuned on target hardware.
 
-1. Loads the robot cell + state from the same JSON the main process uses.
+However, note that in final production, there would be more services that need to be run simultaneously, such as reading multiple inputs and also producing lighting effects, etc.
+
+The assignment of processes to cores and how they line up with physical vs logical cores will need to be tested on the actual hardware together with other services, and may require tweaks to the default process counts or the use of process affinity settings.
+
+### 3.2 Collision Worker process initialisation
+
+Each collision-checking worker, at start:
+
+1. Loads the compas_fab robot cell + state from the same JSON the main process uses.
 2. Patches in the precomputed touch-lists (`per_rigid_body`, `per_tool`)
-   from `bullet_collision_pair_discovery.json`. This is mandatory — without
-   it self-collision will fire constantly.
+   from `bullet_collision_pair_discovery.json`. This is to reduce unnecessary collision checks. We can still run without importing this file, but it's important to show a warning message to the user.
 3. Opens a **`direct`-mode** PyBullet connection (no GUI).
 4. Constructs a `PyBulletPlanner`, calls `set_robot_cell` and
    `set_robot_cell_state` once.
@@ -159,19 +170,26 @@ is recreated per call.**
 The main process also opens **one `gui`-mode** PyBullet connection used only
 for visualisation. That client is touched only by the UI thread.
 
-### 3.3 Deterministic chunking
+### 3.3 Chunking and ordering
 
-Both pools partition their work **once at startup** into contiguous chunks,
-one chunk per worker. **No load balancing at runtime.** Chunk sizes differ
-by at most 1.
+Both schedulers partition their work **once at startup** into contiguous chunks, one chunk per worker invocation.
+Chunk sizes differ by at most 1.
 
 - Forward chunks partition the integer set `{1, 2, …, N_FORWARD_STEPS}` (N
   defaults to 12) across `n_forward_workers`.
 - Proximity chunks partition `{0, 1, 2, 3, 4, 5}` (the six joint axes)
   across `n_prox_workers`.
 
-A worker invocation does **exactly** `len(chunk)` collision checks. This
-makes per-tick cost predictable and removes scheduler jitter.
+A worker invocation does **exactly** `len(chunk)` collision checks. This makes per-tick cost predictable and removes scheduler jitter.
+
+Ordering guarantees to preserve:
+
+- Forward batch order is deterministic (step 1..N reconstruction is stable).
+- Proximity batch order is deterministic (axis and offset order is stable).
+- Returned collision flags must preserve the same order as submitted configs.
+
+Even with queue priority, this deterministic ordering contract must not
+change.
 
 ### 3.4 Forward (synchronous, safety gate)
 
@@ -232,7 +250,7 @@ the forward sweep is the gate.
 Both clamps return a scalar in `[0, 1]`, applied **as the minimum** of the
 two to the entire velocity vector.
 
-### 4.1 Path clamp (from the forward bool list)
+### 4.1 Forward-collision speed clamp (from the forward bool list)
 
 Find the smallest `k` (1-based) such that step `k` is in collision. Let
 `d = k * FORWARD_STEP_DEG` (degrees of joint-space distance to the nearest
@@ -279,12 +297,12 @@ density** — exact widget choices are free.
   every control tick — running the collision check on the GUI client every
   tick costs ~20 ms and would cap the live rate.
 - **FPS readout**: `ctrl <actual>/<target>  gui <actual>`. Two numbers: the
-  control-loop EMA and the view-loop EMA. Colour the control number red
-  when it falls below 90 % of target.
-- **Clamp readout**: `path=<value>  prox=<value>  final=<min>`, three
+  control-loop EMA and the view-loop EMA. Colour the text box background red
+  when it falls below 90 % of target. If there are other input or output services in the future, add more readouts here.
+- **Clamp readout**: `forward_collision_speed=<value>  prox=<value>  final=<min>`, three
   scalars in `[0, 1]`.
 - **Touch-list banner** (informational): patched body / tool counts and
-  total skip-pair counts, plus a keyboard cheat-sheet.
+  total skip-pair counts, plus a keyboard cheat-sheet. No longer needed after integrating haptic dials.
 
 ### 5.2 Per-axis row (one per joint, six rows)
 
@@ -307,7 +325,8 @@ Each row shows, for joint `i`:
 - **Velocity bar** — a horizontal strip spanning `[−max_vel[i], +max_vel[i]]`:
   - A filled band from 0 to `v_out` (final clamped axis velocity).
   - Vertical tick marks at `v_des` (blue), `v_cmd` (grey), `v_after_path`
-    (orange), `v_out` (black) — four distinct markers showing the stages of
+    (orange, currently named from legacy terminology), `v_out`
+    (black) — four distinct markers showing the stages of
     the clamp pipeline.
   - Compact text labels for `d=` (desired) at the left edge and `o=`
     (output) at the right edge in deg/s.
@@ -324,19 +343,21 @@ Each row shows, for joint `i`:
 
 ### 5.4 Clamp-diagnostics panel
 
-Three horizontal progress bars labelled:
-- **Path clamp** — value of `path_scalar` (0..1).
-- **Proximity clamp** — value of `prox_scalar`.
-- **Speed (% of max)** — `|v_out| / |max_vel|` in 6D L2 norm.
+Three horizontal progress bars in the same row, labelled:
+- **Proximity collision clamp** — value of `prox_scalar`.
+- **Forward collision clamp** — value of  `forward_collision_scalar` (0..1).
+- **Overall Speed Reduction (% of max)** — due to the two clamps.
 
-Plus one detail line showing: nearest proximity distance, nearest path
-distance, `|v_cmd|`, `|v_out|`, current path-clamp shape, proximity age (ms),
+Plus one detail line showing: nearest proximity distance, nearest forward
+collision distance, `|v_cmd|`, `|v_out|`, current forward-collision speed
+clamp shape, proximity age (ms),
 proximity pipeline duration (ms).
 
 ### 5.5 Controls panel
 
 Sliders / numeric entries for: Target FPS, Slow key dps, Fast key dps,
-Proximity floor %, Path cutoff °. A radio pair for the path-clamp shape
+Proximity floor %, Path cutoff °. A radio pair for the forward-collision
+speed clamp shape
 (`linear` vs `exponential`), and a separate slider for the exponential
 steepness `k`. Two buttons: **Reset pose** (to the home position), **Stop
 (zero vel)** (clears the current velocity but keeps held keys).
@@ -369,6 +390,7 @@ The UI thread MUST NOT:
 - Releasing a key always clears it from the held set (even if focus moved
   away between press and release).
 - Every input change rebuilds the entire `IntentSnapshot` and rebinds it.
+- Future integration with haptic dials may require a richer input representation than a set of held keys; design the snapshot accordingly (e.g. a dict of axis name → value).
 
 ---
 
@@ -416,7 +438,6 @@ Written by the control thread, line-buffered, one file per session under
   - `n` — monotonically-increasing tick index.
   - `t` — seconds since session start.
   - `dt` — measured tick duration.
-  - `keys` — sorted list of held keys.
   - `v_des`, `v_cmd`, `v_out`, `pos`, `vel` — six-element float arrays in
     degrees / deg/s.
   - `in_coll` — current-pose collision status (may be null between
@@ -428,8 +449,7 @@ Written by the control thread, line-buffered, one file per session under
     for replay tools.
   - `prox` — list of six packed ints, one per axis.
   - `prox_age_ms`, `prox_pipe_ms` — staleness and pipeline timing.
-  - `cfg` — snapshot of all tunables (per-axis limits, slow/fast dps,
-    floor, cutoff, shape, exp_k, target_fps).
+  - `cfg` — snapshot of all tunables (per-axis limits, floor, cutoff, shape, exp_k, target_fps).
 
 ### 6.4 Metrics JSON (`--metrics`)
 
@@ -448,10 +468,6 @@ forward from each scripted dispatch time until the held-key set first
 matches the expected post-event state, and recording the time delta. This
 measures **end-to-end UI → control responsiveness**, not just the UI event
 delay.
-
-**Resize stall** is measured by finding the worst view-loop dt in the
-1.5 s window following each resize event. Captures the toolkit's
-re-layout freeze.
 
 ### 6.5 Testing matrix
 
@@ -487,8 +503,6 @@ collision checks.
   reapply the patch or avoid the round-trip.
 - **PyBullet `gui` connections are thread-affine.** The single GUI client
   may only be touched from one thread. Workers must use `direct`.
-- **Touch lists are mandatory.** Without `_apply_touch_lists` the home pose
-  reports as colliding.
 - **Tk's tcl bindings do not release the GIL well.** Pushing the view-loop
   rate above ~15 Hz on Windows starves the control thread; the symptoms
   look like a broken worker pool but are actually GIL contention. A Pygame
