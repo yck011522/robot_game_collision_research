@@ -115,6 +115,7 @@ JOINT_NAMES = [
 # Scene loading
 # ---------------------------------------------------------------------------
 
+
 def _load_scene():
     data = json_load(JSON_PATH)
     robot_cell = data["robot_cell"]
@@ -123,7 +124,9 @@ def _load_scene():
     if "RB8" in robot_cell_state.rigid_body_states:
         robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
-    lower = [joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES]
+    lower = [
+        joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES
+    ]
     upper = [joints[n].limit.upper if joints[n].limit else math.pi for n in JOINT_NAMES]
     return robot_cell, robot_cell_state, lower, upper
 
@@ -132,10 +135,12 @@ def _load_scene():
 # Deterministic config generator
 # ---------------------------------------------------------------------------
 
+
 def _config_at_step(step, lower, upper, speed, dt):
     t = step * dt
     return [
-        0.5 * (lower[i] + upper[i]) + 0.45 * (upper[i] - lower[i]) * math.sin(speed * t + i * 0.9)
+        0.5 * (lower[i] + upper[i])
+        + 0.45 * (upper[i] - lower[i]) * math.sin(speed * t + i * 0.9)
         for i in range(6)
     ]
 
@@ -155,6 +160,7 @@ _PROC_STATE: dict = {}
 def _proc_initializer() -> None:
     class _NS:
         pass
+
     ns = _NS()
     robot_cell, robot_cell_state, _, _ = _load_scene()
     client = PyBulletClient(connection_type="direct", verbose=False)
@@ -205,14 +211,16 @@ def _proc_check_batch(configs):
 # Chunking
 # ---------------------------------------------------------------------------
 
+
 def _split_into_chunks(configs: list, chunk_size: int) -> list:
     """Split into chunks of size `chunk_size` (last chunk may be smaller)."""
-    return [configs[i:i + chunk_size] for i in range(0, len(configs), chunk_size)]
+    return [configs[i : i + chunk_size] for i in range(0, len(configs), chunk_size)]
 
 
 # ---------------------------------------------------------------------------
 # Per-case runner
 # ---------------------------------------------------------------------------
+
 
 def run_case(n_workers: int, configs: list, chunk_size: int) -> dict:
     """Run one (N, chunk_size) case.  Setup excluded; only dispatch+wait is timed."""
@@ -260,7 +268,8 @@ def run_case(n_workers: int, configs: list, chunk_size: int) -> dict:
         "worker_wall_min_s": min(worker_secs) if worker_secs else 0.0,
         "imbalance_pct": (
             (max(worker_secs) - min(worker_secs)) / max(worker_secs) * 100.0
-            if worker_secs and max(worker_secs) > 0 else 0.0
+            if worker_secs and max(worker_secs) > 0
+            else 0.0
         ),
     }
 
@@ -268,6 +277,7 @@ def run_case(n_workers: int, configs: list, chunk_size: int) -> dict:
 # ---------------------------------------------------------------------------
 # Strategy descriptors
 # ---------------------------------------------------------------------------
+
 
 def build_strategies(total_configs: int, n_workers: int, chunk_sizes: list) -> list:
     """Return [(label, chunk_size), ...] for this N.
@@ -286,6 +296,7 @@ def build_strategies(total_configs: int, n_workers: int, chunk_sizes: list) -> l
 # Output formatting
 # ---------------------------------------------------------------------------
 
+
 def _print_grid(rows_by_strategy: dict, n_values: list, total_configs: int) -> None:
     print("\n--- total_hz  (rows = N workers, columns = strategy) ---")
     strategies = list(rows_by_strategy.keys())
@@ -296,13 +307,16 @@ def _print_grid(rows_by_strategy: dict, n_values: list, total_configs: int) -> N
         cells = []
         for s in strategies:
             r = next((x for x in rows_by_strategy[s] if x["n"] == n), None)
-            cells.append("{:>10.1f}".format(r["total_hz"]) if r else "{:>10}".format("-"))
+            cells.append(
+                "{:>10.1f}".format(r["total_hz"]) if r else "{:>10}".format("-")
+            )
         print("  {:>3}".format(n) + "".join("  " + c for c in cells))
 
 
 # ---------------------------------------------------------------------------
 # Markdown report
 # ---------------------------------------------------------------------------
+
 
 def _md_strategy_table(rows: list) -> str:
     if not rows:
@@ -316,8 +330,12 @@ def _md_strategy_table(rows: list) -> str:
         spd = r["total_hz"] / single_hz if single_hz else 1.0
         lines.append(
             "| {n} | {nc} | {hz:.1f} | {pinst:.1f} | {spd:.2f}x | {wall:.2f} | {imb:.1f}% |".format(
-                n=r["n"], nc=r["n_chunks"], hz=r["total_hz"],
-                pinst=r["per_inst_hz"], spd=spd, wall=r["wall_s"],
+                n=r["n"],
+                nc=r["n_chunks"],
+                hz=r["total_hz"],
+                pinst=r["per_inst_hz"],
+                spd=spd,
+                wall=r["wall_s"],
                 imb=r["imbalance_pct"],
             )
         )
@@ -424,13 +442,13 @@ def write_report(
     if overall_best:
         lines.append(
             "- **Overall best:** `{label}` @ N={n} -> {hz:.1f} checks/s".format(
-                label=overall_best_label, n=overall_best_n, hz=overall_best,
+                label=overall_best_label,
+                n=overall_best_n,
+                hz=overall_best,
             )
         )
     if static_best > 0:
-        lines.append(
-            "- **Static best:** {:.1f} checks/s".format(static_best)
-        )
+        lines.append("- **Static best:** {:.1f} checks/s".format(static_best))
         if overall_best:
             delta = (overall_best - static_best) / static_best * 100.0
             lines.append(
@@ -469,25 +487,42 @@ def write_report(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _parse_args():
     p = argparse.ArgumentParser(
         description="Static vs dynamic config distribution benchmark",
     )
-    p.add_argument("--total-configs", type=int, default=5000,
-                   help="Total unique configurations (default 5000)")
-    p.add_argument("--max-instances", type=int, default=16,
-                   help="Test N = 1 .. max (default 16)")
-    p.add_argument("--instances", type=str, default=None,
-                   help="Explicit comma-separated N values (overrides --max-instances)")
-    p.add_argument("--chunk-sizes", type=str, default="100,10,1",
-                   help="Comma-separated dynamic chunk sizes (default 100,10,1). "
-                        "'static' is always included.")
-    p.add_argument("--speed", type=float, default=0.6,
-                   help="Trajectory speed rad/s (default 0.6)")
-    p.add_argument("--dt", type=float, default=0.01,
-                   help="Trajectory dt s (default 0.01)")
-    p.add_argument("--no-report", action="store_true",
-                   help="Skip writing the markdown report")
+    p.add_argument(
+        "--total-configs",
+        type=int,
+        default=5000,
+        help="Total unique configurations (default 5000)",
+    )
+    p.add_argument(
+        "--max-instances", type=int, default=16, help="Test N = 1 .. max (default 16)"
+    )
+    p.add_argument(
+        "--instances",
+        type=str,
+        default=None,
+        help="Explicit comma-separated N values (overrides --max-instances)",
+    )
+    p.add_argument(
+        "--chunk-sizes",
+        type=str,
+        default="100,10,1",
+        help="Comma-separated dynamic chunk sizes (default 100,10,1). "
+        "'static' is always included.",
+    )
+    p.add_argument(
+        "--speed", type=float, default=0.6, help="Trajectory speed rad/s (default 0.6)"
+    )
+    p.add_argument(
+        "--dt", type=float, default=0.01, help="Trajectory dt s (default 0.01)"
+    )
+    p.add_argument(
+        "--no-report", action="store_true", help="Skip writing the markdown report"
+    )
     return p.parse_args()
 
 
@@ -512,8 +547,11 @@ def main():
         "  collision mode    : fail_fast\n"
         "  setup time        : EXCLUDED via initializer + warmup ping round\n".format(
             cpu=multiprocessing.cpu_count(),
-            tc=args.total_configs, ns=n_values, cs=chunk_sizes,
-            spd=args.speed, dt=args.dt,
+            tc=args.total_configs,
+            ns=n_values,
+            cs=chunk_sizes,
+            spd=args.speed,
+            dt=args.dt,
         )
     )
 
@@ -530,13 +568,22 @@ def main():
         strategies = build_strategies(args.total_configs, n, chunk_sizes)
         for label, cs in strategies:
             n_chunks = math.ceil(args.total_configs / cs)
-            print("  {:<10s} (chunk_size={:>4d}, n_chunks={:>4d}) ... ".format(
-                label, cs, n_chunks), end="", flush=True)
+            print(
+                "  {:<10s} (chunk_size={:>4d}, n_chunks={:>4d}) ... ".format(
+                    label, cs, n_chunks
+                ),
+                end="",
+                flush=True,
+            )
             r = run_case(n, configs, cs)
             rows_by_strategy[label].append(r)
-            print("{hz:>8.1f} hz  (wall {wall:>5.2f}s  imb {imb:>4.1f}%)".format(
-                hz=r["total_hz"], wall=r["wall_s"], imb=r["imbalance_pct"],
-            ))
+            print(
+                "{hz:>8.1f} hz  (wall {wall:>5.2f}s  imb {imb:>4.1f}%)".format(
+                    hz=r["total_hz"],
+                    wall=r["wall_s"],
+                    imb=r["imbalance_pct"],
+                )
+            )
         print()
 
     _print_grid(rows_by_strategy, n_values, args.total_configs)
@@ -561,14 +608,20 @@ def main():
         if static_hz is not None and best_hz > 0:
             pct = (best_hz - static_hz) / static_hz * 100.0
             margin = "  ({:+.1f}% vs static)".format(pct)
-        print("  N={:>2}  best={:<10s}  {:>7.1f} hz{}".format(n, best_label, best_hz, margin))
+        print(
+            "  N={:>2}  best={:<10s}  {:>7.1f} hz{}".format(
+                n, best_label, best_hz, margin
+            )
+        )
 
     if not args.no_report:
         write_report(
-            REPORT_PATH, rows_by_strategy,
+            REPORT_PATH,
+            rows_by_strategy,
             n_values=n_values,
             total_configs=args.total_configs,
-            speed=args.speed, dt=args.dt,
+            speed=args.speed,
+            dt=args.dt,
         )
         print("\nMarkdown report written: {}".format(REPORT_PATH))
 
