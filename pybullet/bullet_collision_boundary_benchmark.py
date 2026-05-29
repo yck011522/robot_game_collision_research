@@ -57,12 +57,10 @@ def load_scene():
     # Workaround for URDF export issue in compas_fab/compas_robots path.
     robot_cell.robot_model.attr.pop("transmission", None)
 
-    # Keep parity with existing scripts in this repo.
-    if "RB8" in robot_cell_state.rigid_body_states:
-        robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
-
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
-    lower = [joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES]
+    lower = [
+        joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES
+    ]
     upper = [joints[n].limit.upper if joints[n].limit else math.pi for n in JOINT_NAMES]
     return robot_cell, robot_cell_state, lower, upper
 
@@ -219,7 +217,9 @@ def search_exp_binary(
     return SearchResult(True, boundary_q0, checks, tries, "state_changed"), cc_times
 
 
-def auto_config(t: float, lower: list[float], upper: list[float], speed: float) -> list[float]:
+def auto_config(
+    t: float, lower: list[float], upper: list[float], speed: float
+) -> list[float]:
     vals = []
     for i in range(6):
         mid = 0.5 * (lower[i] + upper[i])
@@ -367,7 +367,10 @@ def print_result(r: dict):
     print("p95_cc_ms          : {:.4f}".format(r["p95_cc_ms"]))
     print(
         "boundary_found(+/-): {}/{}  (success {:.1%}/{:.1%})".format(
-            r["found_pos"], r["found_neg"], r["success_ratio_pos"], r["success_ratio_neg"]
+            r["found_pos"],
+            r["found_neg"],
+            r["success_ratio_pos"],
+            r["success_ratio_neg"],
         )
     )
     print("boundary_fail(+/-) : {}/{}".format(r["fail_pos"], r["fail_neg"]))
@@ -376,7 +379,11 @@ def print_result(r: dict):
 def print_comparison(a: dict, b: dict):
     print("\n=== comparison ({} vs {}) ===".format(b["method"], a["method"]))
     print("delta_cycle_hz     : {:+.2f}".format(b["cycle_hz"] - a["cycle_hz"]))
-    print("ratio_cycle_hz     : {:.3f}x".format(b["cycle_hz"] / a["cycle_hz"] if a["cycle_hz"] > 0 else float("nan")))
+    print(
+        "ratio_cycle_hz     : {:.3f}x".format(
+            b["cycle_hz"] / a["cycle_hz"] if a["cycle_hz"] > 0 else float("nan")
+        )
+    )
     print("delta_check_hz     : {:+.2f}".format(b["check_hz"] - a["check_hz"]))
     print("delta_mean_cc_ms   : {:+.4f}".format(b["mean_cc_ms"] - a["mean_cc_ms"]))
 
@@ -384,15 +391,21 @@ def print_comparison(a: dict, b: dict):
 def parse_args():
     parser = argparse.ArgumentParser(description="Joint-0 boundary-search benchmark")
     parser.add_argument("--duration", type=float, default=20.0, help="Seconds per case")
-    parser.add_argument("--speed", type=float, default=0.6, help="Auto motion speed (rad/s)")
+    parser.add_argument(
+        "--speed", type=float, default=0.6, help="Auto motion speed (rad/s)"
+    )
     parser.add_argument(
         "--method",
         choices=["linear", "exp_binary", "all"],
         default="all",
         help="Boundary search method",
     )
-    parser.add_argument("--step", type=float, default=0.03, help="Initial step size (rad)")
-    parser.add_argument("--max-tries", type=int, default=64, help="Max outward tries per side")
+    parser.add_argument(
+        "--step", type=float, default=0.03, help="Initial step size (rad)"
+    )
+    parser.add_argument(
+        "--max-tries", type=int, default=64, help="Max outward tries per side"
+    )
     parser.add_argument(
         "--refine-iters",
         type=int,

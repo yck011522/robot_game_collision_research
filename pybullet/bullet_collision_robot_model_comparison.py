@@ -75,9 +75,6 @@ def _apply_workarounds(robot_cell: RobotCell, robot_cell_state) -> None:
     """Apply the three workarounds used by every script in this repo."""
     # URDF export crash from tag-less URDFGenericElement.
     robot_cell.robot_model.attr.pop("transmission", None)
-    # Persistent overlap allow-list for the bucket rigid body.
-    if robot_cell_state is not None and "RB8" in robot_cell_state.rigid_body_states:
-        robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
 
 
 def _load_json_cell():

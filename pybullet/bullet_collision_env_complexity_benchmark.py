@@ -74,8 +74,6 @@ JOINT_NAMES = [
 
 def _apply_workarounds(robot_cell: RobotCell, robot_cell_state: RobotCellState) -> None:
     robot_cell.robot_model.attr.pop("transmission", None)
-    if "RB8" in robot_cell_state.rigid_body_states:
-        robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
 
 
 def _load_asset_model(robot_dir: str):

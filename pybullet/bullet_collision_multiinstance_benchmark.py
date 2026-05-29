@@ -115,15 +115,16 @@ JOINT_NAMES = [
 # Scene loading
 # ---------------------------------------------------------------------------
 
+
 def _load_scene():
     data = json_load(JSON_PATH)
     robot_cell = data["robot_cell"]
     robot_cell_state = data["robot_cell_state"]
     robot_cell.robot_model.attr.pop("transmission", None)
-    if "RB8" in robot_cell_state.rigid_body_states:
-        robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
-    lower = [joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES]
+    lower = [
+        joints[n].limit.lower if joints[n].limit else -math.pi for n in JOINT_NAMES
+    ]
     upper = [joints[n].limit.upper if joints[n].limit else math.pi for n in JOINT_NAMES]
     return robot_cell, robot_cell_state, lower, upper
 
@@ -132,11 +133,13 @@ def _load_scene():
 # Deterministic config generator
 # ---------------------------------------------------------------------------
 
+
 def _config_at_step(step, lower, upper, speed, dt):
     """Pure function: step index -> joint values."""
     t = step * dt
     return [
-        0.5 * (lower[i] + upper[i]) + 0.45 * (upper[i] - lower[i]) * math.sin(speed * t + i * 0.9)
+        0.5 * (lower[i] + upper[i])
+        + 0.45 * (upper[i] - lower[i]) * math.sin(speed * t + i * 0.9)
         for i in range(6)
     ]
 
@@ -151,10 +154,12 @@ def generate_configs(n: int, speed: float, dt: float) -> list:
 # Worker state — process global for ProcessPool, thread-local for ThreadPool
 # ---------------------------------------------------------------------------
 
-_PROC_STATE: dict = {}        # per-process global dict (one per worker process)
+_PROC_STATE: dict = {}  # per-process global dict (one per worker process)
 _THREAD_STATE = threading.local()  # per-thread storage
 _THREAD_SETUP_LOCK = threading.Lock()  # compas_fab+PyBullet setup is NOT thread-safe
-_THREAD_BARRIER: "threading.Barrier | None" = None  # set per-case to force N distinct threads
+_THREAD_BARRIER: "threading.Barrier | None" = (
+    None  # set per-case to force N distinct threads
+)
 
 
 def _setup_pybullet_into(state) -> None:
@@ -187,8 +192,10 @@ def _setup_pybullet_into(state) -> None:
 
 def _proc_initializer() -> None:
     """ProcessPoolExecutor initializer — runs once per worker process."""
+
     class _NS:
         pass
+
     ns = _NS()
     _setup_pybullet_into(ns)
     _PROC_STATE["ns"] = ns
@@ -211,6 +218,7 @@ def _thread_get_state():
 # ---------------------------------------------------------------------------
 # Task functions (must be at module level for ProcessPool pickling)
 # ---------------------------------------------------------------------------
+
 
 def _proc_ping(_):
     return os.getpid()
@@ -267,6 +275,7 @@ def _thread_ping(_):
 # Chunk splitter
 # ---------------------------------------------------------------------------
 
+
 def _split_into_chunks(configs: list, n_chunks: int) -> list:
     L = len(configs)
     chunk_size = (L + n_chunks - 1) // n_chunks
@@ -282,6 +291,7 @@ def _split_into_chunks(configs: list, n_chunks: int) -> list:
 # ---------------------------------------------------------------------------
 # Per-N runner
 # ---------------------------------------------------------------------------
+
 
 def run_case(n_workers: int, configs: list, backend: str) -> dict:
     global _THREAD_BARRIER
@@ -301,7 +311,7 @@ def run_case(n_workers: int, configs: list, backend: str) -> dict:
         _THREAD_BARRIER = threading.Barrier(n_real_workers)
         ping_fn = _thread_ping
         batch_fn = _thread_check_batch
-        ping_count = n_real_workers   # one per thread (each waits on barrier)
+        ping_count = n_real_workers  # one per thread (each waits on barrier)
 
     try:
         # Force every worker to complete setup BEFORE we start the timer.
@@ -333,7 +343,8 @@ def run_case(n_workers: int, configs: list, backend: str) -> dict:
         "worker_wall_mean_s": statistics.fmean(worker_secs),
         "imbalance_pct": (
             (max(worker_secs) - min(worker_secs)) / max(worker_secs) * 100.0
-            if max(worker_secs) > 0 else 0.0
+            if max(worker_secs) > 0
+            else 0.0
         ),
     }
 
@@ -342,14 +353,20 @@ def run_case(n_workers: int, configs: list, backend: str) -> dict:
 # Output formatting
 # ---------------------------------------------------------------------------
 
+
 def _format_row(r: dict, single_hz: float) -> str:
     spd = r["total_hz"] / single_hz if single_hz else 1.0
     eff = spd / r["n"] * 100.0
     return (
         "  {n:>2}  {hz:>9.1f}  {pinst:>11.1f}  {eff:>6.1f}%  {spd:>6.2f}x  "
         "{wall:>7.2f}s  {imb:>6.1f}%".format(
-            n=r["n"], hz=r["total_hz"], pinst=r["per_inst_hz"],
-            eff=eff, spd=spd, wall=r["wall_s"], imb=r["imbalance_pct"],
+            n=r["n"],
+            hz=r["total_hz"],
+            pinst=r["per_inst_hz"],
+            eff=eff,
+            spd=spd,
+            wall=r["wall_s"],
+            imb=r["imbalance_pct"],
         )
     )
 
@@ -359,9 +376,11 @@ def _print_table(rows: list, title: str) -> None:
         return
     single_hz = rows[0]["total_hz"]
     print("\n--- {} ---".format(title))
-    print("  {:>2}  {:>9}  {:>11}  {:>7}  {:>7}  {:>8}  {:>7}".format(
-        "N", "total_hz", "per_inst_hz", "effic", "speedup", "wall_s", "imbal"
-    ))
+    print(
+        "  {:>2}  {:>9}  {:>11}  {:>7}  {:>7}  {:>8}  {:>7}".format(
+            "N", "total_hz", "per_inst_hz", "effic", "speedup", "wall_s", "imbal"
+        )
+    )
     print("  " + "-" * 64)
     for r in rows:
         print(_format_row(r, single_hz))
@@ -370,6 +389,7 @@ def _print_table(rows: list, title: str) -> None:
 # ---------------------------------------------------------------------------
 # Markdown report
 # ---------------------------------------------------------------------------
+
 
 def _md_table(rows: list) -> str:
     if not rows:
@@ -384,8 +404,13 @@ def _md_table(rows: list) -> str:
         eff = spd / r["n"] * 100.0
         lines.append(
             "| {n} | {hz:.1f} | {pinst:.1f} | {eff:.1f}% | {spd:.2f}x | {wall:.2f} | {imb:.1f}% |".format(
-                n=r["n"], hz=r["total_hz"], pinst=r["per_inst_hz"],
-                eff=eff, spd=spd, wall=r["wall_s"], imb=r["imbalance_pct"],
+                n=r["n"],
+                hz=r["total_hz"],
+                pinst=r["per_inst_hz"],
+                eff=eff,
+                spd=spd,
+                wall=r["wall_s"],
+                imb=r["imbalance_pct"],
             )
         )
     return "\n".join(lines) + "\n"
@@ -438,9 +463,11 @@ def write_report(
         lines.append(
             "- **Process best:** N={} -> {:.1f} checks/s "
             "({:.2f}x over N=1 process, {:.2f}s wall for {} configs)".format(
-                best_proc["n"], best_proc["total_hz"],
+                best_proc["n"],
+                best_proc["total_hz"],
                 best_proc["total_hz"] / single_proc_hz if single_proc_hz else 0,
-                best_proc["wall_s"], total_configs,
+                best_proc["wall_s"],
+                total_configs,
             )
         )
     if best_thr:
@@ -448,18 +475,27 @@ def write_report(
         lines.append(
             "- **Thread best:** N={} -> {:.1f} checks/s "
             "({:.2f}x over N=1 thread, {:.2f}s wall for {} configs)".format(
-                best_thr["n"], best_thr["total_hz"],
+                best_thr["n"],
+                best_thr["total_hz"],
                 best_thr["total_hz"] / single_thr_hz if single_thr_hz else 0,
-                best_thr["wall_s"], total_configs,
+                best_thr["wall_s"],
+                total_configs,
             )
         )
     if best_proc and best_thr:
-        ratio = best_proc["total_hz"] / best_thr["total_hz"] if best_thr["total_hz"] else 0
-        winner = "process" if best_proc["total_hz"] >= best_thr["total_hz"] else "thread"
+        ratio = (
+            best_proc["total_hz"] / best_thr["total_hz"] if best_thr["total_hz"] else 0
+        )
+        winner = (
+            "process" if best_proc["total_hz"] >= best_thr["total_hz"] else "thread"
+        )
         lines.append(
             "- **Winner:** **{}** backend "
             "(process {:.1f} hz vs thread {:.1f} hz, ratio {:.2f}x)".format(
-                winner, best_proc["total_hz"], best_thr["total_hz"], ratio,
+                winner,
+                best_proc["total_hz"],
+                best_thr["total_hz"],
+                ratio,
             )
         )
 
@@ -498,24 +534,47 @@ def write_report(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _parse_args():
     p = argparse.ArgumentParser(
         description="Multi-instance PyBullet collision throughput benchmark v2",
     )
-    p.add_argument("--total-configs", type=int, default=5000,
-                   help="Total unique configurations to process (default 5000)")
-    p.add_argument("--max-instances", type=int, default=16,
-                   help="Test N = 1 .. max (default 16)")
-    p.add_argument("--instances", type=str, default=None,
-                   help="Explicit comma-separated N values (overrides --max-instances)")
-    p.add_argument("--backends", type=str, default="process,threads",
-                   help="Comma-separated list: process,threads  (default both)")
-    p.add_argument("--speed", type=float, default=0.6,
-                   help="Trajectory speed in rad/s (default 0.6)")
-    p.add_argument("--dt", type=float, default=0.01,
-                   help="Trajectory time step in seconds (default 0.01)")
-    p.add_argument("--no-report", action="store_true",
-                   help="Skip writing the markdown report")
+    p.add_argument(
+        "--total-configs",
+        type=int,
+        default=5000,
+        help="Total unique configurations to process (default 5000)",
+    )
+    p.add_argument(
+        "--max-instances", type=int, default=16, help="Test N = 1 .. max (default 16)"
+    )
+    p.add_argument(
+        "--instances",
+        type=str,
+        default=None,
+        help="Explicit comma-separated N values (overrides --max-instances)",
+    )
+    p.add_argument(
+        "--backends",
+        type=str,
+        default="process,threads",
+        help="Comma-separated list: process,threads  (default both)",
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=0.6,
+        help="Trajectory speed in rad/s (default 0.6)",
+    )
+    p.add_argument(
+        "--dt",
+        type=float,
+        default=0.01,
+        help="Trajectory time step in seconds (default 0.01)",
+    )
+    p.add_argument(
+        "--no-report", action="store_true", help="Skip writing the markdown report"
+    )
     return p.parse_args()
 
 
@@ -542,8 +601,11 @@ def main():
         "  collision mode    : fail_fast\n"
         "  setup time        : EXCLUDED via initializer + warmup ping round\n".format(
             cpu=multiprocessing.cpu_count(),
-            tc=args.total_configs, ns=n_values, bk=backends,
-            spd=args.speed, dt=args.dt,
+            tc=args.total_configs,
+            ns=n_values,
+            bk=backends,
+            spd=args.speed,
+            dt=args.dt,
         )
     )
 
@@ -564,16 +626,22 @@ def main():
             print(
                 "{hz:>8.1f} checks/s  ({pinst:>7.1f}/inst  wall {wall:>5.2f}s  "
                 "imb {imb:>4.1f}%)".format(
-                    hz=r["total_hz"], pinst=r["per_inst_hz"],
-                    wall=r["wall_s"], imb=r["imbalance_pct"],
+                    hz=r["total_hz"],
+                    pinst=r["per_inst_hz"],
+                    wall=r["wall_s"],
+                    imb=r["imbalance_pct"],
                 )
             )
         print()
 
     if process_rows:
-        _print_table(process_rows, "Process backend  ({} configs)".format(args.total_configs))
+        _print_table(
+            process_rows, "Process backend  ({} configs)".format(args.total_configs)
+        )
     if thread_rows:
-        _print_table(thread_rows, "Thread backend  ({} configs)".format(args.total_configs))
+        _print_table(
+            thread_rows, "Thread backend  ({} configs)".format(args.total_configs)
+        )
 
     print("\n--- recommendation ---")
     for label, rows in [("process", process_rows), ("threads", thread_rows)]:
@@ -584,7 +652,9 @@ def main():
         print(
             "  [{label:<7}]  best N={n:<2}  {hz:>7.1f} checks/s   "
             "(vs N=1: {spd:.2f}x throughput)".format(
-                label=label, n=best["n"], hz=best["total_hz"],
+                label=label,
+                n=best["n"],
+                hz=best["total_hz"],
                 spd=best["total_hz"] / single_hz if single_hz else 1.0,
             )
         )
@@ -597,14 +667,18 @@ def main():
             "  overall winner: {winner}  "
             "(process best {pp:.1f} hz @ N={pn}  vs  threads best {tt:.1f} hz @ N={tn})".format(
                 winner=winner,
-                pp=bp["total_hz"], pn=bp["n"],
-                tt=bt["total_hz"], tn=bt["n"],
+                pp=bp["total_hz"],
+                pn=bp["n"],
+                tt=bt["total_hz"],
+                tn=bt["n"],
             )
         )
 
     if not args.no_report:
         write_report(
-            REPORT_PATH, process_rows, thread_rows,
+            REPORT_PATH,
+            process_rows,
+            thread_rows,
             total_configs=args.total_configs,
             n_values=n_values,
             speed=args.speed,

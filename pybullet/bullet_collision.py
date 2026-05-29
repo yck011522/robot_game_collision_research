@@ -53,7 +53,6 @@ def main():
 
     # Add allowed touch to the following special case:
     # - The robot's robot link 'base_link_inertia' and rigid body 'RB8' (body_id '9')
-    robot_cell_state.rigid_body_states["RB8"].touch_links = ["base_link_inertia"]
 
     joints = {j.name: j for j in robot_cell.robot_model.get_configurable_joints()}
     lower = [
