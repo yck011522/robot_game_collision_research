@@ -17,10 +17,15 @@ Each tick we:
   3. Velocity-clamp current_v to +/- max_vel.
   4. SYNCHRONOUSLY run the forward-path collision check for v_cmd's
      unit direction (12 steps x FORWARD_STEP_DEG, deterministically
-     split into 6 chunks of 2 -- one chunk per worker). Wait for ALL
-     workers before continuing. No cached result is ever reused.
-  5. SYNCHRONOUSLY run the +/-PROBE_HALF_DEG proximity probes
-     (one axis per worker, 6 workers in parallel). Wait for all.
+     split across `--forward-workers` chunks). Wait for ALL workers
+     before continuing. No cached result is ever reused. This is the
+     SAFETY GATE.
+  5. ASYNCHRONOUSLY dispatch the +/-PROBE_HALF_DEG proximity probes
+     (6 axes split into `--prox-workers` chunks). Fire-and-forget on a
+     SEPARATE process pool so it cannot block the safety gate. The
+     freshest completed batch is used for the proximity soft slow-down;
+     a slightly stale (~1 tick) batch is acceptable because proximity
+     is never a hard safety gate.
   6. Compute path-clamp scalar (safety, can go to 0) and proximity
      scalar (soft slow-down, never below `prox_floor`).
   7. v_out = current_v * min(path_scalar, prox_scalar).
@@ -32,21 +37,27 @@ exactly the direction the robot moves in.
 
 Workers
 -------
+Two independent ProcessPoolExecutors (default 6 + 6 = 12 processes).
+This pairs naturally with a 10-thread production target by running
+`--forward-workers 3 --prox-workers 2` per robot, so two robots fit
+inside 10 worker processes. The chunking is recomputed from the worker
+counts but the partition is fixed at startup -- no load balancing at
+runtime.
+
   - 1 GUI PyBullet (main thread, visualises current pose)
-  - 6 headless workers in a single ProcessPoolExecutor
-      * each tick, first dispatched in 6 forward-check chunks of 2
-        steps (deterministic axis-independent split), then dispatched
-        in 6 proximity chunks (one per joint).
-      * NO async/pipelining. Every tick waits for both batches to
-        finish before producing v_out. Behaviour is independent of
-        worker latency or load.
-  All workers patch in the touch-lists from
-  ``bullet_collision_pair_discovery.json``.
+  - `--forward-workers` synchronous safety-gate workers
+  - `--prox-workers` asynchronous soft-slowdown workers
+
+All workers patch in the touch-lists from
+``bullet_collision_pair_discovery.json``.
 
 Usage
 -----
     conda activate game
     python pybullet/bullet_collision_keyboard_explorer.py
+    # production-equivalent allocation per robot (5 workers / robot):
+    python pybullet/bullet_collision_keyboard_explorer.py \
+        --forward-workers 3 --prox-workers 2
 """
 
 from __future__ import annotations
@@ -113,16 +124,31 @@ PROBE_OFFSETS_RAD = [math.radians(d) for d in PROBE_OFFSETS_DEG]
 # is therefore proportional to actual distance-to-collision, independent of
 # the current speed.
 #
-# DETERMINISTIC DISPATCH: the 12 steps are partitioned into 6 fixed chunks
-# of 2 step-indices each, one chunk per worker. The partition never changes
-# at runtime; there is no automatic load balancing.
+# DETERMINISTIC DISPATCH: forward steps are partitioned into N_FORWARD_WORKERS
+# fixed contiguous chunks (one chunk per worker). Proximity axes are likewise
+# partitioned into N_PROX_WORKERS fixed contiguous chunks of joints. The
+# partitions never change at runtime; the pools do no load balancing.
 N_FORWARD_STEPS = 12
 FORWARD_STEP_DEG = 1.0
 FORWARD_HORIZON_DEG = N_FORWARD_STEPS * FORWARD_STEP_DEG  # 12 deg
-N_WORKERS = 6
-FORWARD_CHUNKS = tuple(
-    tuple(range(2 * i + 1, 2 * i + 3)) for i in range(N_WORKERS)
-)  # ((1,2),(3,4),(5,6),(7,8),(9,10),(11,12))
+DEFAULT_FORWARD_WORKERS = 6  # CLI overridable; production target is 3 per robot
+DEFAULT_PROX_WORKERS = 6  # CLI overridable; production target is 2 per robot
+
+
+def _partition(items, n_chunks):
+    """Split a sequence into n_chunks contiguous tuples, as equal as possible.
+
+    Deterministic: no load balancing. Sizes differ by at most 1.
+    """
+    items = list(items)
+    base, rem = divmod(len(items), n_chunks)
+    out = []
+    i = 0
+    for k in range(n_chunks):
+        size = base + (1 if k < rem else 0)
+        out.append(tuple(items[i : i + size]))
+        i += size
+    return tuple(out)
 
 # UI defaults
 DEFAULT_FPS = 30
@@ -273,6 +299,34 @@ def _proc_proximity(args):
     return out
 
 
+def _proc_proximity_chunk(args):
+    """Run proximity probes for a deterministic subset of joint axes.
+
+    args = (base_rad_tuple, axes_tuple, offsets_rad_tuple)
+    returns dict[int, list[bool]] keyed by axis index.
+    """
+    base_rad, axes, offsets_rad = args
+    planner = _W["planner"]
+    rcs = _W["rcs"]
+    cfg = _W["cfg"]
+    base = list(base_rad)
+    out = {}
+    for axis in axes:
+        axis_out = []
+        for off in offsets_rad:
+            vals = list(base)
+            vals[axis] = vals[axis] + off
+            cfg.joint_values = vals
+            rcs.robot_configuration = cfg
+            try:
+                planner.check_collision(rcs, options={"verbose": False})
+                axis_out.append(False)
+            except CollisionCheckError:
+                axis_out.append(True)
+        out[axis] = axis_out
+    return out
+
+
 def _proc_forward_chunk(args):
     """Check a deterministic subset of forward-trajectory step indices.
 
@@ -313,19 +367,30 @@ class KeyboardExplorer:
     def __init__(
         self,
         root: tk.Tk,
-        executor: ProcessPoolExecutor,
+        fwd_executor: ProcessPoolExecutor,
+        prox_executor: ProcessPoolExecutor,
         gui_planner,
         robot_cell_state,
         joint_limits_rad,
         patch_stats: dict,
+        n_forward_workers: int = DEFAULT_FORWARD_WORKERS,
+        n_prox_workers: int = DEFAULT_PROX_WORKERS,
     ):
         self.root = root
-        self.executor = executor
+        self.fwd_executor = fwd_executor
+        self.prox_executor = prox_executor
         self.gui_planner = gui_planner
         self.robot_cell_state = robot_cell_state
         self.cfg = robot_cell_state.robot_configuration.copy()
         self.joint_limits = joint_limits_rad
         self.patch_stats = patch_stats
+        # Deterministic partitions derived from worker counts
+        self.n_forward_workers = n_forward_workers
+        self.n_prox_workers = n_prox_workers
+        self.forward_chunks = _partition(
+            range(1, N_FORWARD_STEPS + 1), n_forward_workers
+        )
+        self.prox_axis_chunks = _partition(range(6), n_prox_workers)
 
         # State
         self.pos_rad = [math.radians(d) for d in INITIAL_POS_DEG]
@@ -336,14 +401,24 @@ class KeyboardExplorer:
         self.v_out_rad = [0.0] * 6
         self.current_in_coll: bool | None = None
 
-        # Worker results. These are overwritten in-place at the start of
-        # every tick from a synchronous deterministic dispatch -- there is
-        # no cross-tick caching, no async future tracking.
+        # Worker results.
+        #   Forward: written fresh every tick by a synchronous dispatch.
+        #   Proximity: written by an asynchronous dispatch -- the most
+        #     recent completed result is reused while a newer one is in
+        #     flight. Proximity staleness is measured (`prox_age_s`) and
+        #     logged. This is safe because proximity is a *soft* slow-down,
+        #     never a hard safety gate; the forward check is the gate.
         self.prox_results: list[list[bool]] = [
             [False] * len(PROBE_OFFSETS_DEG) for _ in range(6)
         ]
         self.fwd_result: list[bool] = [False] * N_FORWARD_STEPS
         self.fwd_step_deg_used: float = FORWARD_STEP_DEG  # spacing the worker used
+        # Async proximity state
+        self.prox_future = None
+        self.prox_in_flight_t: float = 0.0  # perf_counter() when dispatched
+        self.prox_last_harvest_t: float = time.perf_counter()
+        self.prox_age_s: float = 0.0  # age of the data we just used for clamps
+        self.prox_pipeline_ms: float = 0.0  # last measured dispatch->harvest wall time
 
         # Last computed clamp diagnostics (for the readout panel)
         self.prox_nearest_deg: float | None = None
@@ -649,7 +724,7 @@ class KeyboardExplorer:
             f = open(path, "w", encoding="utf-8", buffering=1)  # line-buffered
             header = {
                 "header": True,
-                "version": 1,
+                "version": 2,
                 "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "joint_names": list(JOINT_NAMES),
                 "initial_pos_deg": list(INITIAL_POS_DEG),
@@ -660,6 +735,13 @@ class KeyboardExplorer:
                 "forward_step_deg": FORWARD_STEP_DEG,
                 "probe_half_deg": PROBE_HALF_DEG,
                 "probe_offsets_deg": list(PROBE_OFFSETS_DEG),
+                "workers": {
+                    "forward": self.n_forward_workers,
+                    "prox": self.n_prox_workers,
+                    "forward_chunks": [list(c) for c in self.forward_chunks],
+                    "prox_axis_chunks": [list(c) for c in self.prox_axis_chunks],
+                    "prox_mode": "async",
+                },
                 "keys": {
                     "fast_pos": list(FAST_POS_KEYS),
                     "slow_pos": list(SLOW_POS_KEYS),
@@ -716,6 +798,8 @@ class KeyboardExplorer:
                 ),
                 "fwd": _pack_bits(self.fwd_result),
                 "prox": [_pack_bits(r) for r in self.prox_results],
+                "prox_age_ms": round(self.prox_age_s * 1000.0, 2),
+                "prox_pipe_ms": round(self.prox_pipeline_ms, 2),
                 "cfg": {
                     "mv": [round(v.get(), 3) for v in self.max_vel_vars],
                     "ma": [round(v.get(), 3) for v in self.max_accel_vars],
@@ -903,34 +987,69 @@ class KeyboardExplorer:
     def _run_forward_check(self, base_rad: tuple, step_vec: tuple) -> list[bool]:
         """Synchronous, deterministic forward-trajectory check.
 
-        Dispatches exactly N_WORKERS chunks (one per worker), waits for ALL
-        of them, then reassembles into a single ordered bool list of length
-        N_FORWARD_STEPS. Each chunk has a fixed pre-defined set of step
-        indices; the worker pool is not free to load-balance.
+        Dispatches exactly `n_forward_workers` chunks (one per worker), waits
+        for ALL of them, then reassembles into a single ordered bool list of
+        length N_FORWARD_STEPS. Each chunk has a fixed pre-defined set of
+        step indices; the worker pool is not free to load-balance.
         """
         futures = [
-            self.executor.submit(_proc_forward_chunk, (base_rad, step_vec, chunk))
-            for chunk in FORWARD_CHUNKS
+            self.fwd_executor.submit(
+                _proc_forward_chunk, (base_rad, step_vec, chunk)
+            )
+            for chunk in self.forward_chunks
         ]
         results = [f.result() for f in futures]  # blocks until each completes
         out = [False] * N_FORWARD_STEPS
-        for chunk, chunk_result in zip(FORWARD_CHUNKS, results):
+        for chunk, chunk_result in zip(self.forward_chunks, results):
             for k, hit in zip(chunk, chunk_result):
                 out[k - 1] = hit
         return out
 
-    def _run_proximity_check(self, base_rad: tuple) -> list[list[bool]]:
-        """Synchronous, deterministic proximity probe scan.
+    def _dispatch_proximity_async(self, base_rad: tuple) -> None:
+        """Submit one proximity batch (n_prox_workers tasks) and return.
 
-        Exactly 6 workers, one per joint axis, each runs 2*PROBE_HALF_DEG
-        offset checks for its axis. No load balancing.
+        Does NOT block. If a previous batch is still in flight we keep
+        waiting for it and skip this dispatch -- never queue, never let the
+        pool back up.
         """
+        if self.prox_future is not None:
+            return
         offs = tuple(PROBE_OFFSETS_RAD)
         futures = [
-            self.executor.submit(_proc_proximity, (base_rad, axis, offs))
-            for axis in range(6)
+            self.prox_executor.submit(
+                _proc_proximity_chunk, (base_rad, axes, offs)
+            )
+            for axes in self.prox_axis_chunks
         ]
-        return [f.result() for f in futures]
+        self.prox_future = futures
+        self.prox_in_flight_t = time.perf_counter()
+
+    def _harvest_proximity_nonblocking(self) -> bool:
+        """If the latest proximity batch is done, harvest it. Return True iff
+        we updated `self.prox_results`.
+        """
+        if self.prox_future is None:
+            return False
+        if not all(f.done() for f in self.prox_future):
+            return False
+        try:
+            new_results: list[list[bool]] = [
+                [False] * len(PROBE_OFFSETS_DEG) for _ in range(6)
+            ]
+            for f in self.prox_future:
+                per_axis = f.result()
+                for axis, bits in per_axis.items():
+                    new_results[axis] = bits
+            self.prox_results = new_results
+            now = time.perf_counter()
+            self.prox_pipeline_ms = (now - self.prox_in_flight_t) * 1000.0
+            self.prox_last_harvest_t = now
+        except Exception as exc:
+            print("Proximity worker error:", exc, file=sys.stderr)
+            # Keep prior prox_results (favours "slow down" over "speed up")
+        finally:
+            self.prox_future = None
+        return True
 
     def _tick(self) -> None:
         t_now = time.perf_counter()
@@ -948,6 +1067,12 @@ class KeyboardExplorer:
             self.fps_ema = (
                 1 - self.fps_alpha
             ) * self.fps_ema + self.fps_alpha * inst_fps
+
+        # 0. Harvest any completed proximity batch BEFORE computing clamps,
+        #    so we use the freshest available data.
+        self._harvest_proximity_nonblocking()
+        # Age of the proximity data we're about to use (s since harvest)
+        self.prox_age_s = t_now - self.prox_last_harvest_t
 
         # 1. Desired velocity from keys
         v_des_dps = self._desired_velocity_dps()
@@ -967,10 +1092,7 @@ class KeyboardExplorer:
         self.v_cmd_rad = list(new_v)
 
         # 4. SYNCHRONOUS forward path check for the EXACT v_cmd direction.
-        #    Wait for all 6 worker chunks before proceeding. If v_cmd is
-        #    effectively zero there is no direction to check and v_out will
-        #    be zero anyway, so we record an all-clear result without any
-        #    dispatch (this is a no-op for safety, never for motion).
+        #    This is the safety gate. We wait for ALL forward chunks.
         base = tuple(self.pos_rad)
         v_norm = math.sqrt(sum(v * v for v in self.v_cmd_rad))
         if v_norm > math.radians(0.5):  # > 0.5 deg/s combined
@@ -981,11 +1103,12 @@ class KeyboardExplorer:
         else:
             self.fwd_result = [False] * N_FORWARD_STEPS
 
-        # 5. SYNCHRONOUS proximity probe scan. Always run (the bars show
-        #    the static landscape regardless of motion).
-        self.prox_results = self._run_proximity_check(base)
+        # 5. ASYNCHRONOUS proximity dispatch (soft slow-down, not safety).
+        #    Fire-and-forget: harvested at the start of a future tick. We
+        #    skip if a previous batch is still pending (no queueing).
+        self._dispatch_proximity_async(base)
 
-        # 6. Compute clamps from the FRESH results.
+        # 6. Compute clamps from the FRESH forward + possibly-stale prox.
         path_scalar = self._compute_path_scalar()
         prox_scalar = self._compute_prox_scalar(self.v_cmd_rad)
         self.last_path_scalar = path_scalar
@@ -1189,12 +1312,15 @@ class KeyboardExplorer:
         self.diag_detail.config(
             text=(
                 "nearest prox = {pd:>8s}   nearest path = {ad:>8s}   "
-                "|v_cmd| = {vc:5.1f} dps   |v_out| = {vo:5.1f} dps   shape = {sh}".format(
+                "|v_cmd| = {vc:5.1f} dps   |v_out| = {vo:5.1f} dps   shape = {sh}   "
+                "prox age = {age:4.0f} ms   prox pipe = {pipe:4.0f} ms".format(
                     pd=prox_d,
                     ad=path_d,
                     vc=v_cmd_norm_dps,
                     vo=v_out_norm_dps,
                     sh=self.path_shape_var.get(),
+                    age=self.prox_age_s * 1000.0,
+                    pipe=self.prox_pipeline_ms,
                 )
             )
         )
@@ -1268,7 +1394,32 @@ def _wait_for_workers(executor: ProcessPoolExecutor, n: int) -> None:
     _ = list(executor.map(_proc_ping, range(n * 3)))
 
 
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument(
+        "--forward-workers",
+        type=int,
+        default=DEFAULT_FORWARD_WORKERS,
+        help="processes dedicated to the synchronous forward path check "
+        "(default {})".format(DEFAULT_FORWARD_WORKERS),
+    )
+    p.add_argument(
+        "--prox-workers",
+        type=int,
+        default=DEFAULT_PROX_WORKERS,
+        help="processes dedicated to the asynchronous proximity probe scan "
+        "(default {})".format(DEFAULT_PROX_WORKERS),
+    )
+    return p.parse_args(argv)
+
+
 def main() -> None:
+    args = _parse_args()
+    n_fwd = max(1, min(N_FORWARD_STEPS, args.forward_workers))
+    n_prox = max(1, min(6, args.prox_workers))
+
     if not os.path.exists(DISCOVERY_PATH):
         raise SystemExit(
             "Discovery JSON not found: {}\n  Run bullet_collision_pair_discovery.py first.".format(
@@ -1306,22 +1457,34 @@ def main() -> None:
     except CollisionCheckError:
         pass
 
-    n_workers = N_WORKERS  # exactly 6, one per forward chunk / one per axis
-    print("Spawning {} headless workers ...".format(n_workers))
-    executor = ProcessPoolExecutor(max_workers=n_workers, initializer=_proc_init)
+    print(
+        "Spawning workers: {} forward (sync) + {} proximity (async) ...".format(
+            n_fwd, n_prox
+        )
+    )
+    fwd_executor = ProcessPoolExecutor(max_workers=n_fwd, initializer=_proc_init)
+    prox_executor = ProcessPoolExecutor(max_workers=n_prox, initializer=_proc_init)
     print("Warming up workers ...")
-    _wait_for_workers(executor, n_workers)
+    _wait_for_workers(fwd_executor, n_fwd)
+    _wait_for_workers(prox_executor, n_prox)
     print("Workers ready.")
+    fwd_chunks = _partition(range(1, N_FORWARD_STEPS + 1), n_fwd)
+    prox_chunks = _partition(range(6), n_prox)
+    print("  forward chunks   :", fwd_chunks)
+    print("  prox axis chunks :", prox_chunks)
 
     print("Launching UI. Focus the window then press 1/q/a/z etc. to jog.")
     root = tk.Tk()
     app = KeyboardExplorer(
         root,
-        executor,
+        fwd_executor,
+        prox_executor,
         gui_planner,
         robot_cell_state,
         joint_limits,
         patch_stats,
+        n_forward_workers=n_fwd,
+        n_prox_workers=n_prox,
     )
 
     def on_close():
@@ -1330,10 +1493,11 @@ def main() -> None:
             app.close_log()
         except Exception:
             pass
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        for ex in (fwd_executor, prox_executor):
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         try:
             gui_client.__exit__(None, None, None)
         except Exception:
@@ -1348,10 +1512,11 @@ def main() -> None:
             app.close_log()
         except Exception:
             pass
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        for ex in (fwd_executor, prox_executor):
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         try:
             gui_client.__exit__(None, None, None)
         except Exception:

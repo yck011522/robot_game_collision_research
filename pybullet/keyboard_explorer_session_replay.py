@@ -376,6 +376,290 @@ def find_top_mismatches(replay: list[dict], n: int = 10) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Full-session analyzer
+# ---------------------------------------------------------------------------
+
+
+def _percentile(sorted_xs: list[float], p: float) -> float:
+    if not sorted_xs:
+        return 0.0
+    k = max(0, min(len(sorted_xs) - 1, int(round((p / 100.0) * (len(sorted_xs) - 1)))))
+    return sorted_xs[k]
+
+
+def _hist(xs: list[float], edges: list[float]) -> list[int]:
+    out = [0] * (len(edges) + 1)  # last bin = > edges[-1]
+    for x in xs:
+        placed = False
+        for i, e in enumerate(edges):
+            if x <= e:
+                out[i] += 1
+                placed = True
+                break
+        if not placed:
+            out[-1] += 1
+    return out
+
+
+def analyze(session: Session, replay: list[dict]) -> None:
+    h = session.header
+    rows = [r["row"] for r in replay]
+    n = len(rows)
+    if n < 2:
+        print("Not enough ticks to analyze.")
+        return
+    n_steps = h["n_forward_steps"]
+    step_deg = h["forward_step_deg"]
+    probe_half = h["probe_half_deg"]
+    probe_len = len(h["probe_offsets_deg"])
+
+    # --- performance ---
+    dts = [r["dt"] for r in rows[1:]]  # skip first (cold)
+    dts_sorted = sorted(dts)
+    fps_overall = (n - 1) / (rows[-1]["t"] - rows[0]["t"])
+
+    # split by "was forward dispatched" (v_cmd norm > 0.5 dps)
+    moving_dts = []
+    idle_dts = []
+    for r in rows[1:]:
+        vn = _vnorm(r["v_cmd"])
+        (moving_dts if vn > 0.5 else idle_dts).append(r["dt"])
+
+    print("\n" + "=" * 70)
+    print("PERFORMANCE")
+    print("=" * 70)
+    print(
+        "  total ticks      : {:d}  ({:.1f} s of recording)".format(
+            n, rows[-1]["t"] - rows[0]["t"]
+        )
+    )
+    print(
+        "  effective FPS    : {:.2f}    (target {:g})".format(
+            fps_overall, h["defaults"].get("target_fps", 30)
+        )
+    )
+    print(
+        "  dt overall  ms   : median={:.1f}  p90={:.1f}  p99={:.1f}  max={:.1f}".format(
+            1000 * _percentile(dts_sorted, 50),
+            1000 * _percentile(dts_sorted, 90),
+            1000 * _percentile(dts_sorted, 99),
+            1000 * dts_sorted[-1],
+        )
+    )
+    if moving_dts:
+        ms = sorted(moving_dts)
+        print(
+            "  dt MOVING   ms   : n={:d}  median={:.1f}  p90={:.1f}  p99={:.1f}".format(
+                len(ms),
+                1000 * _percentile(ms, 50),
+                1000 * _percentile(ms, 90),
+                1000 * _percentile(ms, 99),
+            )
+        )
+    if idle_dts:
+        ids = sorted(idle_dts)
+        print(
+            "  dt IDLE     ms   : n={:d}  median={:.1f}  p90={:.1f}  p99={:.1f}".format(
+                len(ids),
+                1000 * _percentile(ids, 50),
+                1000 * _percentile(ids, 90),
+                1000 * _percentile(ids, 99),
+            )
+        )
+        # Forward-dispatch cost estimate = moving median - idle median
+        if moving_dts:
+            fwd_cost_ms = 1000 * (
+                _percentile(sorted(moving_dts), 50) - _percentile(ids, 50)
+            )
+            print(
+                "  forward dispatch cost (median moving - median idle):"
+                "  {:+.1f} ms / tick".format(fwd_cost_ms)
+            )
+
+    # --- safety: how close did we get? ---
+    p_nears = [r["p_near"] for r in rows if r["p_near"] is not None]
+    q_nears = [r["q_near"] for r in rows if r["q_near"] is not None]
+    in_coll = [r for r in rows if r.get("in_coll")]
+
+    print("\n" + "=" * 70)
+    print("SAFETY")
+    print("=" * 70)
+    print(
+        "  in_collision      : {:d} tick(s)  ({:.2f}% of session)".format(
+            len(in_coll), 100.0 * len(in_coll) / n
+        )
+    )
+    if in_coll:
+        print("    first 10 collision ticks:")
+        for r in in_coll[:10]:
+            print(
+                "      #{:5d}  t={:6.2f}s  keys={}  pos={}".format(
+                    r["n"], r["t"], r["keys"], _fmt_vec(r["pos"])
+                )
+            )
+
+    print(
+        "  ticks w/ fwd hit  : {:d}  ({:.1f}% of session)".format(
+            len(p_nears), 100.0 * len(p_nears) / n
+        )
+    )
+    if p_nears:
+        ps = sorted(p_nears)
+        print(
+            "  p_near deg        : min={:.0f}  p10={:.0f}  median={:.0f}  max={:.0f}".format(
+                ps[0],
+                _percentile(ps, 10),
+                _percentile(ps, 50),
+                ps[-1],
+            )
+        )
+        # bucket histogram of p_near in degrees (1..12)
+        edges = list(range(1, n_steps + 1))
+        hist = _hist(ps, edges)
+        labels = ["<= {:d} deg".format(e) for e in edges] + [
+            "> {:d} deg".format(edges[-1])
+        ]
+        print("  p_near histogram :")
+        for lbl, c in zip(labels, hist):
+            bar = "#" * int(60 * c / max(1, max(hist)))
+            print("    {:<14s} {:5d}  {}".format(lbl, c, bar))
+
+    # Closest cartesian-ish proxy: minimum p_near across all motion ticks
+    moving_with_hit = [
+        r for r in rows if r["p_near"] is not None and _vnorm(r["v_out"]) > 0.05
+    ]
+    if moving_with_hit:
+        ps = sorted(r["p_near"] for r in moving_with_hit)
+        print(
+            "  WHILE MOVING (|v_out|>0.05dps) and fwd hit present:"
+        )
+        print(
+            "    p_near deg     : min={:.0f}  p10={:.0f}  median={:.0f}".format(
+                ps[0], _percentile(ps, 10), _percentile(ps, 50)
+            )
+        )
+
+    print(
+        "  ticks w/ prox hit : {:d}  ({:.1f}% of session)".format(
+            len(q_nears), 100.0 * len(q_nears) / n
+        )
+    )
+    if q_nears:
+        qs = sorted(q_nears)
+        print(
+            "  q_near deg        : min={:.0f}  p10={:.0f}  median={:.0f}  max={:.0f}".format(
+                qs[0],
+                _percentile(qs, 10),
+                _percentile(qs, 50),
+                qs[-1],
+            )
+        )
+
+    # Detect "frozen against obstacle" runs: ps==0 streaks
+    streaks = []
+    cur = 0
+    for r in rows:
+        if r["ps"] == 0.0:
+            cur += 1
+        else:
+            if cur > 0:
+                streaks.append(cur)
+            cur = 0
+    if cur:
+        streaks.append(cur)
+    if streaks:
+        s = sorted(streaks, reverse=True)
+        print("  path-stop streaks : count={:d}  longest={:d} ticks  median={:d}".format(
+            len(s), s[0], s[len(s) // 2]
+        ))
+
+    # --- closest approach across whole session ---
+    # joint-space distance is bounded by min(p_near, q_near). Smaller = more dangerous.
+    closest = None
+    closest_tick = None
+    for r in rows:
+        d_candidates = []
+        if r["p_near"] is not None:
+            d_candidates.append(r["p_near"])
+        if r["q_near"] is not None:
+            d_candidates.append(r["q_near"])
+        if not d_candidates:
+            continue
+        d = min(d_candidates)
+        if closest is None or d < closest:
+            closest = d
+            closest_tick = r["n"]
+    if closest is not None:
+        print(
+            "  closest approach  : {:.0f} deg (joint-space, at tick #{:d})".format(
+                closest, closest_tick
+            )
+        )
+
+    # --- input usage ---
+    active_ticks = sum(1 for r in rows if r["keys"])
+    print("\n" + "=" * 70)
+    print("INPUT / MOTION")
+    print("=" * 70)
+    print(
+        "  active ticks (any key) : {:d}  ({:.1f}% of session)".format(
+            active_ticks, 100.0 * active_ticks / n
+        )
+    )
+    # per-axis motion in degrees integrated
+    axis_motion = [0.0] * 6
+    for r in rows:
+        for i in range(6):
+            axis_motion[i] += abs(r["v_out"][i]) * r["dt"]
+    print("  total |motion| per axis (deg):")
+    for i, name in enumerate(h["joint_names"]):
+        print("    J{:d} {:<22s} {:7.1f} deg".format(i, name, axis_motion[i]))
+    # key usage count
+    key_count: dict[str, int] = {}
+    for r in rows:
+        for k in r["keys"]:
+            key_count[k] = key_count.get(k, 0) + 1
+    if key_count:
+        top = sorted(key_count.items(), key=lambda kv: -kv[1])[:10]
+        print("  top 10 keys by frequency:")
+        for k, c in top:
+            print("    '{}'  {:d} ticks".format(k, c))
+
+    # --- scalar distribution ---
+    print("\n" + "=" * 70)
+    print("CLAMP SCALAR DISTRIBUTION (final_scalar = min(path, prox))")
+    print("=" * 70)
+    edges = [0.0, 0.25, 0.5, 0.75, 0.99, 1.0]
+    labels = [
+        "== 0.00         (full stop, path block)",
+        "(0.00, 0.25]    (heavy clamp)",
+        "(0.25, 0.50]    (moderate clamp)",
+        "(0.50, 0.75]    (prox floor region)",
+        "(0.75, 0.99]    (mild slowdown)",
+        "== 1.00         (free motion)",
+    ]
+    buckets = [0] * len(labels)
+    for r in rows:
+        fs = r["fs"]
+        if fs == 0.0:
+            buckets[0] += 1
+        elif fs <= 0.25:
+            buckets[1] += 1
+        elif fs <= 0.50:
+            buckets[2] += 1
+        elif fs <= 0.75:
+            buckets[3] += 1
+        elif fs < 1.0:
+            buckets[4] += 1
+        else:
+            buckets[5] += 1
+    for lbl, c in zip(labels, buckets):
+        pct = 100.0 * c / n
+        bar = "#" * int(60 * c / max(1, max(buckets)))
+        print("  {:<42s} {:5d}  {:5.1f}%  {}".format(lbl, c, pct, bar))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -412,6 +696,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0.05,
         help="dps threshold for the --creep filter (default 0.05)",
     )
+    p.add_argument(
+        "--analyze",
+        action="store_true",
+        help="full-session performance + safety analysis (timing, p_near hist, etc.)",
+    )
     args = p.parse_args(argv)
 
     path = _resolve_path(args.log)
@@ -423,6 +712,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print_summary(session, replay)
+
+    if args.analyze:
+        analyze(session, replay)
 
     if args.creep:
         suspects = find_creep(session, replay, args.v_thresh)
