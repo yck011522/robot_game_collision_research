@@ -84,6 +84,24 @@ JSON_PATH = os.path.join(HERE, "robot_cell_and_state.json")
 DISCOVERY_PATH = os.path.join(HERE, "bullet_collision_pair_discovery.json")
 LOG_DIR = os.path.join(HERE, "explorer_logs")
 
+# Vendored rtde_core lives in ../control_integration. Put it on sys.path
+# before importing so the explorer is self-contained.
+_CTRL_INTEGRATION = os.path.normpath(os.path.join(HERE, "..", "control_integration"))
+if _CTRL_INTEGRATION not in sys.path:
+    sys.path.insert(0, _CTRL_INTEGRATION)
+import rtde_core  # noqa: E402
+
+# RTDE / real-robot output defaults. The control loop runs at ~40-50 Hz with
+# jitter, so we drive servoJ at a nominal 50 Hz and use the actual measured
+# tick dt as the servoJ interpolation time (clamped to >= 1/SERVO_HZ) so a
+# late tick never forces the controller into a slam.
+DEFAULT_ROBOT_IP = "192.168.0.2"
+DEFAULT_SERVO_HZ = 50.0
+DEFAULT_LOOKAHEAD_TIME = 0.05
+DEFAULT_SERVO_GAIN = 500
+SERVOJ_SPEED = 0.5  # unused by servoJ in position mode but required by API
+SERVOJ_ACCELERATION = 0.5
+
 
 def _pack_bits(bits) -> int:
     """Pack a sequence of bools into a single integer (bit i = bits[i])."""
@@ -394,6 +412,102 @@ def _proc_forward_chunk(args):
 
 
 # ---------------------------------------------------------------------------
+# RTDE / real-robot output
+# ---------------------------------------------------------------------------
+
+
+class URDriver:
+    """Thin servoJ wrapper around the shared rtde_core helpers.
+
+    Lifecycle is fully owned by ``main()``: connect on startup, ``send()``
+    once per control tick from the control thread, ``shutdown()`` on exit.
+
+    The control thread runs ~40-50 Hz with jitter. ``RTDEControlInterface``
+    is initialised at ``servo_hz`` (50 Hz nominal) so its internal timing
+    matches the expected stream rate, and ``send()`` uses the actual
+    measured tick dt (clamped to ``>= 1/servo_hz``) as the servoJ
+    interpolation time so a late tick will not push the controller into a
+    slam.
+    """
+
+    def __init__(
+        self,
+        robot_ip: str,
+        servo_hz: float = DEFAULT_SERVO_HZ,
+        lookahead_time: float = DEFAULT_LOOKAHEAD_TIME,
+        gain: int = DEFAULT_SERVO_GAIN,
+        run_motion: bool = True,
+    ) -> None:
+        self.servo_hz = servo_hz
+        self.servo_dt = 1.0 / servo_hz
+        self.lookahead_time = lookahead_time
+        self.gain = gain
+        self.run_motion = run_motion
+        print(f"[UR] Connecting receive to {robot_ip} ...")
+        self.rtde_r = rtde_core.connect_receive(robot_ip)
+        self.actual_q = list(self.rtde_r.getActualQ())
+        print(f"[UR] Actual joints (rad): {self.actual_q}")
+        if run_motion:
+            print(f"[UR] Connecting control to {robot_ip} @ {servo_hz:.1f} Hz ...")
+            self.rtde_c = rtde_core.connect_control(robot_ip, frequency_hz=servo_hz)
+        else:
+            print("[UR] DRY RUN: control channel not opened; no servoJ will be sent.")
+            self.rtde_c = None
+        self._closed = False
+        self._send_lock = threading.Lock()
+        self.last_send_err: str | None = None
+        self.n_sent = 0
+
+    def initial_pose_rad(self) -> list[float]:
+        return list(self.actual_q)
+
+    def send(self, q_rad: list[float], dt: float) -> bool:
+        """Send one servoJ setpoint. Returns False on error (does not raise)."""
+        if self._closed or self.rtde_c is None:
+            return False
+        servo_time = max(self.servo_dt, dt)
+        try:
+            with self._send_lock:
+                self.rtde_c.servoJ(
+                    list(q_rad),
+                    SERVOJ_SPEED,
+                    SERVOJ_ACCELERATION,
+                    servo_time,
+                    self.lookahead_time,
+                    self.gain,
+                )
+            self.n_sent += 1
+            self.last_send_err = None
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.last_send_err = str(exc)
+            return False
+
+    def read_actual(self) -> list[float] | None:
+        try:
+            return list(self.rtde_r.getActualQ())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.rtde_c is None:
+            return
+        print(f"[UR] Stopping servoJ stream ({self.n_sent} setpoints sent).")
+        try:
+            with self._send_lock:
+                self.rtde_c.servoStop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[UR] servoStop failed: {exc}", file=sys.stderr)
+        try:
+            self.rtde_c.stopScript()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[UR] stopScript failed: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Tk application
 # ---------------------------------------------------------------------------
 
@@ -411,6 +525,7 @@ class KeyboardExplorer:
         n_forward_workers: int = DEFAULT_FORWARD_WORKERS,
         n_prox_workers: int = DEFAULT_PROX_WORKERS,
         gui_refresh_hz: float = DEFAULT_GUI_REFRESH_HZ,
+        ur_driver: "URDriver | None" = None,
     ):
         self.root = root
         self.fwd_executor = fwd_executor
@@ -429,8 +544,23 @@ class KeyboardExplorer:
         )
         self.prox_axis_chunks = _partition(range(6), n_prox_workers)
 
+        # Real-robot output (optional). When present, the integrated pose
+        # `self.pos_rad` is also streamed to the robot via servoJ from the
+        # control thread, and the *initial* pose is seeded from the live
+        # robot state to avoid a startup slam.
+        self.ur_driver = ur_driver
+        self.ur_send_ok = True
+        self.ur_send_fail_count = 0
+
         # State
-        self.pos_rad = [math.radians(d) for d in INITIAL_POS_DEG]
+        if ur_driver is not None:
+            self.pos_rad = list(ur_driver.initial_pose_rad())
+            print(
+                "[UR] Seeded explorer pose from robot actual joints (deg): "
+                + ", ".join(f"{math.degrees(v):.2f}" for v in self.pos_rad)
+            )
+        else:
+            self.pos_rad = [math.radians(d) for d in INITIAL_POS_DEG]
         self.vel_rad = [0.0] * 6  # current actual velocity
         self.v_des_rad = [0.0] * 6
         self.v_cmd_rad = [0.0] * 6  # after accel + max_vel clamp, before safety
@@ -983,6 +1113,15 @@ class KeyboardExplorer:
     # ------------------------------------------------------------ buttons
 
     def _reset_pose(self) -> None:
+        if self.ur_driver is not None:
+            # Hard-reset to INITIAL_POS_DEG would slam the real robot.
+            # Re-sync to actual joint state instead (zero motion).
+            actual = self.ur_driver.read_actual()
+            if actual is not None:
+                self.pos_rad = list(actual)
+            self.vel_rad = [0.0] * 6
+            self._push_pose_to_gui()
+            return
         self.pos_rad = [math.radians(d) for d in INITIAL_POS_DEG]
         self.vel_rad = [0.0] * 6
         self._push_pose_to_gui()
@@ -1251,6 +1390,15 @@ class KeyboardExplorer:
                 self.pos_rad[i] = hi
                 if self.vel_rad[i] > 0:
                     self.vel_rad[i] = 0.0
+
+        # 7b. Stream to real robot (if connected). Sent every control tick
+        # at the loop's actual rate (~40-50 Hz target); servoJ time arg is
+        # the measured dt clamped to >= 1/servo_hz inside the driver.
+        if self.ur_driver is not None:
+            ok = self.ur_driver.send(self.pos_rad, dt)
+            self.ur_send_ok = ok
+            if not ok:
+                self.ur_send_fail_count += 1
 
         # 8. Metrics + log
         self._control_samples.append(
@@ -1754,6 +1902,49 @@ def _parse_args(argv: list[str] | None = None):
             DEFAULT_GUI_REFRESH_HZ
         ),
     )
+    p.add_argument(
+        "--robot-ip",
+        type=str,
+        default=DEFAULT_ROBOT_IP,
+        help="UR robot IP (default {}). Use --no-robot to skip connecting.".format(
+            DEFAULT_ROBOT_IP
+        ),
+    )
+    p.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="Skip the RTDE connection entirely (pure simulation, initial "
+        "pose comes from INITIAL_POS_DEG).",
+    )
+    p.add_argument(
+        "--run-motion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream servoJ to the real robot every control tick (default "
+        "ENABLED). Use --no-run-motion to connect read-only and seed the "
+        "initial pose without commanding any motion.",
+    )
+    p.add_argument(
+        "--servo-hz",
+        type=float,
+        default=DEFAULT_SERVO_HZ,
+        help="Nominal servoJ stream rate used to initialise RTDEControlInterface "
+        "(default {}).".format(DEFAULT_SERVO_HZ),
+    )
+    p.add_argument(
+        "--lookahead-time",
+        type=float,
+        default=DEFAULT_LOOKAHEAD_TIME,
+        help="servoJ lookahead_time seconds (default {}).".format(
+            DEFAULT_LOOKAHEAD_TIME
+        ),
+    )
+    p.add_argument(
+        "--servo-gain",
+        type=int,
+        default=DEFAULT_SERVO_GAIN,
+        help="servoJ gain (default {}).".format(DEFAULT_SERVO_GAIN),
+    )
     return p.parse_args(argv)
 
 
@@ -1815,6 +2006,26 @@ def main() -> None:
     print("  forward chunks   :", fwd_chunks)
     print("  prox axis chunks :", prox_chunks)
 
+    # Real-robot output. Default: connect to DEFAULT_ROBOT_IP and stream
+    # servoJ. Use --no-robot for pure simulation; --no-run-motion to connect
+    # read-only (seeds initial pose but never commands motion).
+    ur_driver: URDriver | None = None
+    if not args.no_robot:
+        if not args.run_motion:
+            print(
+                "[UR] --no-run-motion: connecting read-only, seeding initial "
+                "pose from robot, no servoJ will be sent."
+            )
+        ur_driver = URDriver(
+            args.robot_ip,
+            servo_hz=args.servo_hz,
+            lookahead_time=args.lookahead_time,
+            gain=args.servo_gain,
+            run_motion=args.run_motion,
+        )
+    else:
+        print("[UR] --no-robot: pure simulation, no RTDE connection.")
+
     print("Launching UI. Focus the window then press 1/q/a/z etc. to jog.")
     root = tk.Tk()
     app = KeyboardExplorer(
@@ -1828,6 +2039,7 @@ def main() -> None:
         n_forward_workers=n_fwd,
         n_prox_workers=n_prox,
         gui_refresh_hz=args.gui_hz,
+        ur_driver=ur_driver,
     )
 
     def on_close():
@@ -1838,6 +2050,13 @@ def main() -> None:
         app._stop.set()
         if app._ctrl_thread is not None:
             app._ctrl_thread.join(timeout=2.0)
+        # Stop servoJ stream BEFORE tearing down the rest so the robot
+        # always sees a clean servoStop even if PyBullet/Tk shutdown raises.
+        if ur_driver is not None:
+            try:
+                ur_driver.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[UR] shutdown error: {exc}", file=sys.stderr)
         if args.metrics:
             try:
                 dump_metrics(args.metrics, app)
