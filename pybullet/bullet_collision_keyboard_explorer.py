@@ -133,6 +133,7 @@ FAST_POS_KEYS = ["1", "2", "3", "4", "5", "6"]
 SLOW_POS_KEYS = ["q", "w", "e", "r", "t", "y"]
 SLOW_NEG_KEYS = ["a", "s", "d", "f", "g", "h"]
 FAST_NEG_KEYS = ["z", "x", "c", "v", "b", "n"]
+ALL_JOG_KEYS = set(FAST_POS_KEYS + SLOW_POS_KEYS + SLOW_NEG_KEYS + FAST_NEG_KEYS)
 
 # Probe layout (proximity)
 PROBE_HALF_DEG = 10
@@ -1061,24 +1062,45 @@ class KeyboardExplorer:
     # ------------------------------------------------------------- keyboard
 
     def _bind_keys(self) -> None:
-        all_keys = FAST_POS_KEYS + SLOW_POS_KEYS + SLOW_NEG_KEYS + FAST_NEG_KEYS
-        for k in all_keys:
-            self.root.bind(
-                "<KeyPress-{}>".format(k), lambda e, key=k: self._on_press(key)
-            )
-            self.root.bind(
-                "<KeyRelease-{}>".format(k), lambda e, key=k: self._on_release(key)
-            )
+        # Use generic key handlers and normalize to lowercase so Caps Lock
+        # / shifted letters still map to the intended jog keys.
+        self.root.bind("<KeyPress>", self._on_key_press_event)
+        self.root.bind("<KeyRelease>", self._on_key_release_event)
         self.root.focus_force()
+
+    def _event_to_jog_key(self, event) -> str | None:
+        key = (event.keysym or event.char or "").lower()
+        if not key:
+            return None
+        if len(key) == 1 and key in ALL_JOG_KEYS:
+            return key
+        return None
+
+    def _on_key_press_event(self, event) -> None:
+        key = self._event_to_jog_key(event)
+        if key is None:
+            return
+        self._on_press(key)
+
+    def _on_key_release_event(self, event) -> None:
+        key = self._event_to_jog_key(event)
+        if key is None:
+            return
+        self._on_release(key)
 
     def _on_press(self, key: str) -> None:
         if self._focus_is_text_entry():
             return
+        if key in self.pressed:
+            return
         self.pressed.add(key)
+        self._input_events.append((time.perf_counter(), "press", key))
         self._rebuild_intent()
 
     def _on_release(self, key: str) -> None:
         # Always discard so we don't get a stuck key if focus moved away.
+        if key in self.pressed:
+            self._input_events.append((time.perf_counter(), "release", key))
         self.pressed.discard(key)
         self._rebuild_intent()
 
