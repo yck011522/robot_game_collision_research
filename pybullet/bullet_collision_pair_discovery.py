@@ -40,7 +40,7 @@ Usage
     python pybullet/bullet_collision_pair_discovery.py --duration 3600
 
     # Custom worker count
-    python pybullet/bullet_collision_pair_discovery.py --workers 8 --duration 600
+    python pybullet/bullet_collision_pair_discovery.py --workers 18 --duration 600
 """
 
 from __future__ import annotations

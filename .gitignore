@@ -7,3 +7,4 @@ pybullet/_shots/
 pybullet/explorer_logs/
 pybullet/_tk_smoke_*
 pybullet/__pycache__/
+pybullet/RobotCollisionEnvironment.3dmbak
